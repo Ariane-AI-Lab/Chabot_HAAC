@@ -1,22 +1,21 @@
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
-from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 import requests
 import re
 import os
 import time
-from collections import defaultdict
 from dotenv import load_dotenv
 from retrieve import configurer_chatbot, poser_question_avec_memoire
+from filters import is_rate_limited, handle_trivial, SPAM_REPLY
 
 load_dotenv()
 
 app = FastAPI()
 
-#----------------------------------------------------------------------------
-# Chargement des variables d'environnement pour WhatsApp
-#----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Variables d'environnement WhatsApp
+# ---------------------------------------------------------------------------
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -30,44 +29,9 @@ if not PHONE_NUMBER_ID:
 if not VERIFY_TOKEN:
     raise ValueError("VERIFY_TOKEN manquant dans le fichier .env")
 
-
-#----------------------------------------------------------------------------
-# CONSTANTES
-#----------------------------------------------------------------------------
-
-    # Limites pour la détection de spam (nombre de messages et fenêtre temporelle)
-SPAM_MAX_MESSAGES = 5       
-SPAM_WINDOW_SECONDS = 60    
-
-SPAM_REPLY = (
-    "⚠️ Vous envoyez des messages trop rapidement. "
-    "Merci de patienter quelques instants avant de poser votre prochaine question."
-)
-
-
-    # Mots-clés et patterns qui signalent un message trivial / hors-sujet
-TRIVIAL_PATTERNS = [
-    r"^\s*(bonjour|bonsoir|salut|hello|hi|hey|coucou|allo|allô)\s*[!?.]*\s*$",
-    r"^\s*(merci|thanks|thx|thank you|ok merci|super merci)\s*[!?.]*\s*$",
-    r"^\s*(ok|okay|d'accord|dacord|oui|non|yes|no|👍|👎|😊|🙏)\s*$",
-    r"^\s*.{0,2}\s*$",
-    r"^\s*(test|testing|essai|123|ping)\s*[!?.]*\s*$",
-]
-
-TRIVIAL_COMPILED = [re.compile(p, re.IGNORECASE | re.UNICODE) for p in TRIVIAL_PATTERNS]
-
-TRIVIAL_REPLY = (
-    "👋 Salut ! Je suis l'assistant officiel de la HAAC (Haute Autorité de l'Audiovisuel "
-    "et de la Communication du Bénin).\n\n"
-    "Je suis ici pour répondre à vos questions sur la réglementation audiovisuelle, "
-    "les textes officiels et les procédures de la HAAC.\n\n"
-    "N'hésitez pas à me poser votre question ! 😊"
-)
-
-
-#----------------------------------------------------------------------------
-# CONFIGURATION DU CHATBOT
-#----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Chargement du chatbot
+# ---------------------------------------------------------------------------
 
 try:
     chatbot = configurer_chatbot()
@@ -76,95 +40,30 @@ except Exception as e:
     print(f"[INIT] ❌ Erreur lors du chargement du chatbot : {e}")
     raise
 
-
 # ---------------------------------------------------------------------------
-# MODÈLES PYDANTIC POUR LES REQUÊTES API
+# Modèles Pydantic
 # ---------------------------------------------------------------------------
 
 class QuestionRequest(BaseModel):
-    """Modèle pour les requêtes de questions à l'API"""
     question: str
-    user_id: str | None = None  # Optionnel : ID utilisateur pour la mémoire de conversation
-
-
-# ---------------------------------------------------------------------------
-# ANTI-SPAM : Nombre limites de messages par utilisateurs et fenêtre de temps
-# ---------------------------------------------------------------------------
-
-# Stocke les timestamps des derniers messages par utilisateur
-user_message_times: dict[str, list[float]] = defaultdict(list)
-
-def is_rate_limited(sender_id: str) -> bool:
-    now = time.time()
-    times = [t for t in user_message_times[sender_id] if now - t < SPAM_WINDOW_SECONDS]
-    user_message_times[sender_id] = times
-
-    if len(times) >= SPAM_MAX_MESSAGES:
-        print(f"[SPAM] 🚫 {sender_id} bloqué ({len(times)} msgs en {SPAM_WINDOW_SECONDS}s)")
-        return True
-
-    user_message_times[sender_id].append(now)
-    return False
+    user_id: str | None = None
 
 # ---------------------------------------------------------------------------
-# FILTRAGE DES MESSAGES TRIVIAUX
+# Formatage WhatsApp
 # ---------------------------------------------------------------------------
-
-def is_trivial(text: str) -> bool:
-    """Retourne True si le message est une salutation, remerciement ou contenu vide."""
-    for pattern in TRIVIAL_COMPILED:
-        if pattern.match(text):
-            print(f"[FILTER] ⚠️ Message trivial détecté : '{text[:50]}'")
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# FORMATAGE WHATSAPP
-# ---------------------------------------------------------------------------
-
-
-# def markdown_to_whatsapp(text: str) -> str:
-#     text = text.replace("**", "*")                              # 1. Gras d'abord
-#     text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)             # 2. Titres
-#     text = re.sub(r'_(.+?)_', r'\1', text)                     # 3. Italique
-#     text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE)  # 4. Listes
-#     text = re.sub(r'\n{3,}', '\n\n', text)                     # 5. Espacement
-#     return text.strip()
-
 
 def markdown_to_whatsapp(text: str) -> str:
-    text = text.replace("**", "*")                                  # Gras : **x** → *x*
-    text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)                  # Titres : ## x → *x*
-    text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE) # Listes
-    text = re.sub(r'\n{3,}', '\n\n', text)                          # Espacement
+    text = text.replace("**", "*")
+    text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)
+    text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-
 # ---------------------------------------------------------------------------
-# ENVOI WHATSAPP
+# Envoi WhatsApp
 # ---------------------------------------------------------------------------
 
 def send_whatsapp_message(to: str, text: str):
-    """
-    Envoie un message texte à un utilisateur via l'API WhatsApp Business (Meta).
-
-    Args:
-        to (str): Numéro de téléphone du destinataire au format international
-                  sans le '+' (ex: '22960112233').
-        text (str): Contenu du message à envoyer.
-
-    Returns:
-        None
-
-    Raises:
-        requests.exceptions.RequestException: En cas d'erreur réseau (timeout,
-                                              connexion refusée, etc.).
-
-    Example:
-        >>> send_whatsapp_message("22960112233", "Bonjour, comment puis-je vous aider ?")
-    """
-
     url = f"https://graph.facebook.com/{WA_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -185,86 +84,62 @@ def send_whatsapp_message(to: str, text: str):
     except requests.exceptions.RequestException as e:
         print(f"[WHATSAPP] ❌ Erreur réseau : {e}")
 
-
 # ---------------------------------------------------------------------------
-# ENDPOINT PLATEFORME EN LIGNE 
+# Endpoint API web
 # ---------------------------------------------------------------------------
 
 @app.post("/api/ask")
 async def ask_question(request_data: QuestionRequest):
-    """
-    Endpoint pour poser des questions au chatbot depuis une plateforme en ligne.
-
-    Args:
-        request_data (QuestionRequest): Corps de la requête contenant :
-            - question (str): La question à poser au chatbot.
-            - user_id (str, optional): ID utilisateur pour maintenir la mémoire
-              de conversation. Généré automatiquement si non fourni.
-
-    Returns:
-        JSONResponse: Un objet JSON contenant :
-            - response (str): La réponse du chatbot.
-            - sources (list): Les fichiers sources utilisés pour la réponse.
-            - user_id (str): L'ID utilisateur (fourni ou généré).
-            - status (str): "success" en cas de succès.
-
-    Raises:
-        400: Si la question est vide.
-        429: Si l'utilisateur dépasse le seuil de messages autorisés (anti-spam).
-        500: En cas d'erreur interne lors du traitement.
-
-    Example:
-        >>> POST /api/ask
-        >>> {"question": "Quelles sont les obligations d'une radio ?", "user_id": "user_123"}
-    """
-
     user_id = None
     try:
         question = request_data.question.strip()
         user_id = request_data.user_id or f"web_user_{int(time.time() * 1000)}"
-        
+
         if not question:
             return JSONResponse(
                 status_code=400,
                 content={"error": "La question ne peut pas être vide", "status": "error"}
             )
-        
-        if is_rate_limited(user_id):
 
+        if is_rate_limited(user_id):
             return JSONResponse(
                 status_code=429,
                 content={"error": SPAM_REPLY, "status": "error"}
             )
-        
+
         print(f"\n{'='*50}")
         print(f"[API] 📩 Question reçue de : {user_id}")
         print(f"[API] 💬 Question : {question}")
-        
-        # Traiter la question avec le chatbot
-        print(f"[FAISS] 🔍 Recherche des documents pertinents...")
+
+        trivial_response = handle_trivial(question, llm=chatbot["llm"])
+        if trivial_response:
+            print(f"[API] 💬 Réponse triviale : '{trivial_response[:60]}'")
+            return {
+                "response": trivial_response,
+                "sources": [],
+                "user_id": user_id,
+                "status": "success"
+            }
+
         t0 = time.time()
-        
         result = poser_question_avec_memoire(chatbot, question, user_id=user_id)
-        
-        t1 = time.time()
-        print(f"[FAISS] ✅ Réponse générée en {t1 - t0:.2f}s")
-        print(f"[FAISS] 📚 Sources : {', '.join(result['sources'])}")
-        print(f"[API] ✅ Traitement terminé en {time.time() - t0:.2f}s")
+
+        print(f"[API] ✅ Réponse générée en {time.time() - t0:.2f}s")
+        print(f"[API] 📚 Sources : {', '.join(result['sources'])}")
         print(f"{'='*50}\n")
-        
+
         return {
             "response": result['response'],
             "sources": result['sources'],
             "user_id": user_id,
             "status": "success"
         }
-    
+
     except Exception as e:
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "status": "error"}
         )
-
 
 # ---------------------------------------------------------------------------
 # Vérification Meta
@@ -279,9 +154,8 @@ async def verify_webhook(request: Request):
     print("[WEBHOOK] ❌ Échec de vérification Meta")
     return Response(content="Verification failed", status_code=403)
 
-
 # ---------------------------------------------------------------------------
-# Endpoint pour recevoir les messages WhatsApp (webhook)
+# Webhook WhatsApp
 # ---------------------------------------------------------------------------
 
 @app.post("/webhook")
@@ -292,7 +166,7 @@ async def handle_message(request: Request):
         entry = data.get('entry', [{}])[0].get('changes', [{}])[0].get('value', {})
         if not entry:
             return {"status": "ok"}
-        
+
         if 'messages' not in entry:
             print("[WEBHOOK] ⚠️ Événement sans message (statut, réaction...) — ignoré")
             return {"status": "ok"}
@@ -310,26 +184,26 @@ async def handle_message(request: Request):
         print(f"[MESSAGE] 📩 De : {sender_id}")
         print(f"[MESSAGE] 💬 Texte : {user_text}")
 
-        # FILTRE 1 : Anti-spam (rate limiting) 
+        # Filtre 1 : anti-spam
         if is_rate_limited(sender_id):
             send_whatsapp_message(sender_id, SPAM_REPLY)
             print(f"[FILTER] 🚫 Réponse anti-spam envoyée à {sender_id}")
             return {"status": "ok"}
 
-        # FILTRE 2 : Messages triviaux 
-        if is_trivial(user_text):
-            send_whatsapp_message(sender_id, TRIVIAL_REPLY)
-            print(f"[FILTER] 💬 Réponse triviale envoyée à {sender_id}")
+        # Filtre 2 : messages triviaux
+        trivial_response = handle_trivial(user_text, llm=chatbot["llm"])
+        if trivial_response:
+            send_whatsapp_message(sender_id, trivial_response)
+            print(f"[FILTER] 💬 Réponse contextuelle envoyée à {sender_id} : '{trivial_response[:60]}'")
             return {"status": "ok"}
 
-        # PIPELINE NORMAL : RAG + LLM
+        # Pipeline RAG normal
         print(f"[FAISS] 🔍 Recherche des documents pertinents...")
         t0 = time.time()
 
         result = poser_question_avec_memoire(chatbot, user_text, user_id=sender_id)
 
-        t1 = time.time()
-        print(f"[FAISS] ✅ Réponse générée en {t1 - t0:.2f}s")
+        print(f"[FAISS] ✅ Réponse générée en {time.time() - t0:.2f}s")
         print(f"[FAISS] 📚 Sources : {', '.join(result['sources'])}")
         print(f"[LLM] 📝 Aperçu : {result['response'][:200]}...")
 
@@ -341,7 +215,7 @@ async def handle_message(request: Request):
 
     except Exception as e:
         print(f"[ERREUR] ❌ {type(e).__name__} — {e}")
-        if sender_id:  # déjà disponible
+        if sender_id:
             send_whatsapp_message(sender_id, "Désolé, une erreur s'est produite. Veuillez réessayer.")
 
     return {"status": "ok"}

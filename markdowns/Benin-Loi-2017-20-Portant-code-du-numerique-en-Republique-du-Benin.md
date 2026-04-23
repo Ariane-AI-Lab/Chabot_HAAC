@@ -575,21 +575,12 @@ Les  services  de  police  judiciaire  peuvent  toutefois  après  accord  du  P
 
 A sa demande, tout utilisateur peut, sauf pour une raison liée au fonctionnement des services d'urgence ou à la tranquillité de l'appelé, s'opposer à l'identification par ses correspondants de son numéro de téléphone.
 
-TITRE
+## TITRE III
+## DES DISPOSITIONS COMMUNES AUX MOYENS D’INFORMATION ET DE COMMUNICATION
+## DE LA PROTECTION DE L’ENFANCE, DE L’ADOLESCENCE, DE LA MORALE PUBLIQUE ET DES BONNES MOEURS
 
-II: DES
-
-ELECTRONIQUES
-
-CHAPITRE
-
-JURIDIQUES
-
-## SECTION I: DES DISPOSITIONS GENERALES
-
-Article 41 :
-
-Prohibition et abrogation des droits exclusifs
+## SECTION I: DE LA PROTECTION DE L’ENFANCE ET DE L’ADOLESCENCE
+### Article 41 : Prohibition et abrogation des droits exclusifs
 
 Toutes dispositions antérieures de quelque nature que ce soit accordant des droits exclusifs sont abrogées.
 
