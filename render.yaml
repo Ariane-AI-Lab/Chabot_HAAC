@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: haac-chatbot-api
+    runtime: python
+    plan: free 
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: WA_API_VERSION
+        value: v19.0
+      - key: PYTHON_VERSION
+        value: 3.10.0
+     
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: GENAI_API_KEY
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
