@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from collections import deque
 from datetime import datetime
 from tavily import TavilyClient
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -117,29 +118,33 @@ def expand_query(llm, query: str) -> list[str]:
 
 
 # --- RÉCUPÉRATION FAISS AVEC SCORE ---
-def retrieve_relevant_docs(vectorstore, queries: list[str], score_threshold: float = 1.2, max_docs: int = 12):
+
+def retrieve_relevant_docs(vectorstore, queries, score_threshold=1.2, max_docs=4):
     all_docs = []
     seen_contents = set()
     best_fallback = None
     best_fallback_score = float('inf')
 
-    for q in queries:
-        try:
-            docs_with_scores = vectorstore.similarity_search_with_score(q, k=8)
-            for doc, score in docs_with_scores:
-                if score < best_fallback_score:
-                    best_fallback_score = score
-                    best_fallback = doc
-                if score <= score_threshold and doc.page_content not in seen_contents:
-                    all_docs.append((doc, score))
-                    seen_contents.add(doc.page_content)
-        except Exception as e:
-            print(f"[RETRIEVE] ⚠️ Erreur sur la requête '{q}' : {e}")
+    def search_one(q):
+        return vectorstore.similarity_search_with_score(q, k=4)
+
+    # Toutes les variantes cherchent EN MÊME TEMPS
+    with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+        results = list(executor.map(search_one, queries))
+
+    for docs_with_scores in results:
+        for doc, score in docs_with_scores:
+            if score < best_fallback_score:
+                best_fallback_score = score
+                best_fallback = doc
+            if score <= score_threshold and doc.page_content not in seen_contents:
+                all_docs.append((doc, score))
+                seen_contents.add(doc.page_content)
 
     all_docs.sort(key=lambda x: x[1])
 
     if not all_docs and best_fallback:
-        print(f"[RETRIEVE] ⚠️ Aucun doc sous le seuil ({score_threshold}). Fallback (score={best_fallback_score:.3f})")
+        print(f"[RETRIEVE] ⚠️ Fallback (score={best_fallback_score:.3f})")
         return [best_fallback]
 
     docs = [doc for doc, score in all_docs[:max_docs]]
@@ -184,9 +189,11 @@ def configurer_chatbot():
         5. N'inclus PAS de noms de fichiers dans ta réponse.
         6. CONCISION — règle absolue :
            - Réponds UNIQUEMENT à ce qui est demandé, rien de plus.
+           - Si la question contient une salutation (bonjour, bonsoir, salut...), réponds-y brièvement avant de donner la réponse. Exemple : "Bonjour ! Voici les pièces à fournir :"
            - Si on demande un NOM → donne uniquement le nom et le titre.
              Exemple : "Le président de la HAAC est *Edouard LOKO*."
-           - Si on demande une LISTE → donne la liste, sans intro ni commentaire.
+           - Si on demande une LISTE → introduis-la en une phrase courte, puis liste les éléments.
+             Exemple : "Voici les pièces à fournir pour votre demande de carte de presse :"
            - Si on demande une EXPLICATION ou une PROCÉDURE → structure avec des points numérotés,
              des sous-points avec tirets (-) si nécessaire, et *texte* pour les termes importants.
            - N'ajoute JAMAIS d'informations complémentaires (mandat, historique, autres fonctions, contexte)
@@ -226,19 +233,27 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     # 1. Historique
     history = memory.get_formatted_history(user_id)
 
-    # 2. Expansion de la requête
-    queries = expand_query(llm, query)
+   # 2. Expansion + Tavily en parallèle (Tavily n'a pas besoin des variantes)
+    
 
-    # 3. FAISS et Tavily en parallèle (les deux systématiquement)
-    print(f"[FAISS] 🔍 Recherche dans les documents locaux...")
+    print(f"[PIPELINE] 🚀 Lancement parallèle : expansion + Tavily...")
     t0 = time.time()
-    docs = retrieve_relevant_docs(vectorstore, queries)
-    print(f"[FAISS] ✅ Terminé en {time.time()-t0:.2f}s")
 
-    print(f"[TAVILY] 🌐 Recherche sur haac.bj...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_queries = executor.submit(expand_query, llm, query)
+        future_tavily  = executor.submit(search_haac_website, query)
+
+        queries        = future_queries.result()
+        tavily_context = future_tavily.result()
+
+    print(f"[PIPELINE] ✅ Expansion + Tavily terminés en {time.time()-t0:.2f}s")
+    print(f"[TAVILY] 📄 {len(tavily_context)} caractères récupérés")
+
+    # 3. FAISS (maintenant qu'on a les variantes)
+    print(f"[FAISS] 🔍 Recherche dans les documents locaux...")
     t1 = time.time()
-    tavily_context = search_haac_website(query)
-    print(f"[TAVILY] ✅ Terminé en {time.time()-t1:.2f}s — {len(tavily_context)} caractères récupérés")
+    docs = retrieve_relevant_docs(vectorstore, queries)
+    print(f"[FAISS] ✅ Terminé en {time.time()-t1:.2f}s")
 
     # 4. Construction des deux contextes séparés
     context_faiss = "\n\n".join([
