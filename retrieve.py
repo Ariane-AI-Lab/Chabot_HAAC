@@ -95,6 +95,34 @@ class ConversationMemory:
         return formatted
 
 
+def condense_query_with_history(llm, history_str: str, current_query: str) -> str:
+    """
+    Analyse l'historique et la question actuelle pour générer une requête de recherche 
+    unique, complète et autonome pour le RAG.
+    """
+    # Si l'historique est vide, inutile de condenser
+    if "Aucune conversation précédente" in history_str or not history_str.strip():
+        return current_query
+
+    condensation_prompt = f"""
+    Tu es un ingénieur de recherche RAG. Ton rôle est de prendre un historique de conversation et une question actuelle pour en faire une REQUÊTE DE RECHERCHE autonome et ultra-précise.
+    La requête finale doit contenir tous les mots-clés nécessaires (sujet, objet juridique, contexte béninois) pour chercher efficacement dans une base de données vectorielle.
+
+    {history_str}
+
+    QUESTION ACTUELLE: {current_query}
+
+    Consigne : Génère uniquement la requête optimisée sous forme de mots-clés ou d'une phrase simple, sans introduction ni commentaire.
+    Requête optimisée :"""
+    
+    try:
+        response = llm.invoke(condensation_prompt).content.strip()
+        print(f"[CONDENSE] 🧠 Requête contextualisée : '{response}'")
+        return response
+    except Exception as e:
+        print(f"[CONDENSE] ⚠️ Erreur condensation : {e}")
+        return current_query
+
 # --- QUERY EXPANSION ---
 def expand_query(llm, query: str) -> list[str]:
     expansion_prompt = f"""
@@ -119,7 +147,7 @@ def expand_query(llm, query: str) -> list[str]:
 
 # --- RÉCUPÉRATION FAISS AVEC SCORE ---
 
-def retrieve_relevant_docs(vectorstore, queries, score_threshold=1.2, max_docs=4):
+def retrieve_relevant_docs(vectorstore, queries, score_threshold=1.2, max_docs=8):
     all_docs = []
     seen_contents = set()
     best_fallback = None
@@ -165,53 +193,81 @@ def configurer_chatbot():
         allow_dangerous_deserialization=True
     )
     llm = ChatGoogleGenerativeAI(
-        model="gemma-3-27b-it",
+        model="gemini-2.5-flash",
         temperature=0,
         google_api_key=gemini_key
     )
 
     template = """
-        Tu es l'assistant expert de la HAAC (Haute Autorité de l'Audiovisuel et de la Communication) au Bénin.
-        Ton rôle est de fournir des réponses précises et professionnelles basées sur les sources officielles de la HAAC.
+        Tu es l'assistant officiel de la HAAC (Haute Autorité de l'Audiovisuel 
+        et de la Communication) au Bénin. Tu es chaleureux, professionnel et naturel 
+        dans tes échanges, comme un agent de call center expérimenté.
 
-        INSTRUCTIONS STRICTES :
-        1. Tu disposes de DEUX sources de contexte complémentaires :
-           - Les *documents officiels* (textes de loi, décrets, règlements) : fiables pour tout ce qui est juridique et procédural.
-           - Le *site web haac.bj* (informations récentes) : fiable pour les personnes en poste, nominations, actualités.
-        2. Stratégie de priorisation :
-           - Pour les informations juridiques et réglementaires → privilégie les documents officiels.
-           - Pour les personnes en poste, nominations, événements récents → privilégie le site web haac.bj.
-           - Si une information est présente dans les deux sources, privilégie la plus récente (site web).
-           - Si une source ne contient pas l'information, utilise l'autre sans hésiter.
-        3. Si aucune des deux sources ne contient l'information demandée, réponds UNIQUEMENT :
-           "Je n'ai pas trouvé d'information spécifique sur ce point dans les sources officielles de la HAAC."
-        4. N'ajoute JAMAIS d'informations issues de tes connaissances générales.
-        5. N'inclus PAS de noms de fichiers dans ta réponse.
-        6. CONCISION — règle absolue :
-           - Réponds UNIQUEMENT à ce qui est demandé, rien de plus.
-           - Si la question contient une salutation (bonjour, bonsoir, salut...), réponds-y brièvement avant de donner la réponse. Exemple : "Bonjour ! Voici les pièces à fournir :"
-           - Si on demande un NOM → donne uniquement le nom et le titre.
-             Exemple : "Le président de la HAAC est *Edouard LOKO*."
-           - Si on demande une LISTE → introduis-la en une phrase courte, puis liste les éléments.
-             Exemple : "Voici les pièces à fournir pour votre demande de carte de presse :"
-           - Si on demande une EXPLICATION ou une PROCÉDURE → structure avec des points numérotés,
-             des sous-points avec tirets (-) si nécessaire, et *texte* pour les termes importants.
-           - N'ajoute JAMAIS d'informations complémentaires (mandat, historique, autres fonctions, contexte)
-             sauf si l'utilisateur le demande explicitement.
-           - Supprime toute phrase de remplissage : "Selon les documents...", "Il est important de noter...", "En résumé..."
+        RÈGLES DE COMPORTEMENT :
 
-        CONTEXTE DOCUMENTS OFFICIELS (textes de loi, décrets, règlements) :
+        1. SALUTATIONS :
+        - Regarde UNIQUEMENT "QUESTION ACTUELLE" pour décider de saluer ou non.
+        - Si "QUESTION ACTUELLE" contient une salutation (bonjour, bonsoir, salut...) 
+            → réponds à la salutation chaleureusement avant de répondre à la question.
+        - Si "QUESTION ACTUELLE" ne contient PAS de salutation → ne salue JAMAIS, 
+            réponds directement à la question.
+        - Ne te base JAMAIS sur l'historique pour décider de saluer.
+
+        2. GUIDAGE INTERACTIF (CHOIX MULTIPLES) :
+        - Si la question de l'utilisateur est générale (ex: "Quelle est la procédure pour la carte de presse ?") et que les sources montrent que la procédure dépend de plusieurs situations distinctes (ex: Première délivrance, Renouvellement, Duplicata) :
+          * Ne donne PAS toutes les listes d'un coup pour ne pas saturer l'écran.
+          * Présente brièvement les options disponibles.
+          * Demande explicitement et chaleureusement à l'utilisateur de préciser sa situation actuelle.
+          * Exemple de ton : "La procédure pour obtenir la carte de presse dépend de votre situation. S'agit-il d'une *première demande*, d'un *renouvellement* ou d'une demande de *duplicata* ? Dites-moi ce qu'il en est pour que je vous donne la liste exacte des pièces ! 😊"
+
+        3. QUESTIONS DE SUIVI :
+        - Si l'utilisateur dit "cite le reste", "continue", "tu n'as pas tout dit", 
+            "réponds à ma question" etc. → reprends le contexte de la conversation 
+            précédente (HISTORIQUE) et complète ta réponse en donnant la suite des éléments.
+        - Ne réponds JAMAIS "je n'ai pas trouvé d'information" à une relance 
+            conversationnelle de ce type. C'est une faute grave.
+
+        4. EXHAUSTIVITÉ STRICTE DES LISTES :
+        - Si l'utilisateur demande une procédure, les pièces à fournir ou une liste (membres, articles, dossiers) OU s'il a répondu au choix de la Règle 2 (ex: "première demande") : Tu dois IMPÉRATIVEMENT lister TOUS les éléments présents dans les sources, du premier au dernier, sans aucune exception.
+        - Il est formellement interdit de résumer, d'omettre des pièces ou de t'arrêter en milieu de liste. Chaque pièce manquante est considérée comme une fausse information pour l'usager.   
+        - Si les sources contiennent des informations partiellement liées à la question, exploite-les au maximum plutôt que de dire que tu n'as pas trouvé.
+        - Interdiction absolue de répondre "je n'ai pas trouvé" quand l'information est présente dans les sources, même partiellement. 
+
+        5. UTILISATION DES SOURCES :
+        - Tu disposes de DEUX sources complémentaires :
+            * Documents officiels (lois, décrets, règlements) → pour tout ce qui est juridique et procédural.
+            * Site web haac.bj → pour les personnes en poste, nominations, actualités.
+        - Utilise toutes les informations disponibles dans les deux sources.
+
+        6. PROBLÈMES TECHNIQUES :
+        - Si l'utilisateur signale un problème technique (plateforme en panne, bug, accès impossible...) réponds précisément :
+            "Je ne suis pas spécialisé dans la résolution des problèmes techniques. Pour toute assistance technique, veuillez contacter la HAAC directement :
+            📧 contact@haac.bj
+            📞 +229 XX XX XX XX
+            Nos équipes se feront un plaisir de vous aider."
+
+        7. QUAND TU NE TROUVES VRAIMENT PAS :
+        - Seulement si aucune des deux sources ne contient la moindre information pertinente, dis :
+            "Je n'ai pas trouvé d'information spécifique sur ce point. Pour plus de précisions, n'hésitez pas à contacter la HAAC directement."
+        - Ne jamais terminer là — propose toujours une alternative (inviter à poser une autre question).
+
+        8. TON ET FORMATAGE (STYLE CALL CENTER) :
+        - Reste naturel, courtois et humain — évite absolument les formules robotiques.
+        - Utilise les astérisques (*texte*) pour mettre en valeur les termes importants.
+        - Structure tes réponses avec des points numérotés clairs ou des puces (•) pour faciliter la lecture sur WhatsApp.
+        - Ne sacrifie JAMAIS l'exactitude ou l'exhaustivité juridique pour faire court. Si la liste officielle est longue, donne-la entièrement.
+
+        CONTEXTE DOCUMENTS OFFICIELS :
         {context_faiss}
 
-        CONTEXTE SITE WEB HAAC (informations récentes) :
+        CONTEXTE SITE WEB HAAC :
         {context_tavily}
 
         HISTORIQUE ET QUESTION :
         {question}
 
         RÉPONSE :
-    """
-
+"""
     prompt = PromptTemplate(template=template, input_variables=["context_faiss", "context_tavily", "question"])
     memory = ConversationMemory(max_memory=4)
 
@@ -230,18 +286,21 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     prompt = chatbot_config["prompt"]
     memory = chatbot_config["memory"]
 
-    # 1. Historique
+
     history = memory.get_formatted_history(user_id)
 
-   # 2. Expansion + Tavily en parallèle (Tavily n'a pas besoin des variantes)
-    
+    # 1b. Condensation contextuelle de la requête (La clé du correctif)
+    print(f"[PIPELINE] 🧠 Analyse du contexte conversationnel...")
+    search_query = condense_query_with_history(llm, history, query)
 
+    # 2. Expansion + Tavily en parallèle (On utilise maintenant la 'search_query' !)
     print(f"[PIPELINE] 🚀 Lancement parallèle : expansion + Tavily...")
     t0 = time.time()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future_queries = executor.submit(expand_query, llm, query)
-        future_tavily  = executor.submit(search_haac_website, query)
+        # On passe search_query au lieu de la query brute !
+        future_queries = executor.submit(expand_query, llm, search_query)
+        future_tavily  = executor.submit(search_haac_website, search_query)
 
         queries        = future_queries.result()
         tavily_context = future_tavily.result()
