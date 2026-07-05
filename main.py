@@ -69,6 +69,7 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 ADMIN_NOM = os.getenv("ADMIN_NOM", "Admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://ton-dashboard.com")
 
 if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID or not VERIFY_TOKEN:
     raise ValueError("Variables d'environnement WhatsApp manquantes dans le fichier .env")
@@ -162,7 +163,7 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
         return
 
     heure = datetime.now().strftime("%d/%m/%Y à %H:%M")
-    dashboard_url = f"https://ton-dashboard.com/conversation/{sender_id}"
+    dashboard_url = f"{DASHBOARD_URL}/conversation/{sender_id}"
 
     html_body = f"""
     <html><body style="font-family: Arial, sans-serif; color: #333;">
