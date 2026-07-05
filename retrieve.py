@@ -13,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
-
 # --- TAVILY : recherche web sur haac.bj (toujours appelé) ---
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
@@ -100,7 +99,6 @@ def condense_query_with_history(llm, history_str: str, current_query: str) -> st
     Analyse l'historique et la question actuelle pour générer une requête de recherche 
     unique, complète et autonome pour le RAG.
     """
-    # Si l'historique est vide, inutile de condenser
     if "Aucune conversation précédente" in history_str or not history_str.strip():
         return current_query
 
@@ -122,6 +120,7 @@ def condense_query_with_history(llm, history_str: str, current_query: str) -> st
     except Exception as e:
         print(f"[CONDENSE] ⚠️ Erreur condensation : {e}")
         return current_query
+
 
 # --- QUERY EXPANSION ---
 def expand_query(llm, query: str) -> list[str]:
@@ -146,7 +145,6 @@ def expand_query(llm, query: str) -> list[str]:
 
 
 # --- RÉCUPÉRATION FAISS AVEC SCORE ---
-
 def retrieve_relevant_docs(vectorstore, queries, score_threshold=1.2, max_docs=8):
     all_docs = []
     seen_contents = set()
@@ -156,7 +154,6 @@ def retrieve_relevant_docs(vectorstore, queries, score_threshold=1.2, max_docs=8
     def search_one(q):
         return vectorstore.similarity_search_with_score(q, k=4)
 
-    # Toutes les variantes cherchent EN MÊME TEMPS
     with ThreadPoolExecutor(max_workers=len(queries)) as executor:
         results = list(executor.map(search_one, queries))
 
@@ -246,16 +243,18 @@ def configurer_chatbot():
             📞 +229 XX XX XX XX
             Nos équipes se feront un plaisir de vous aider."
 
-        7. QUAND TU NE TROUVES VRAIMENT PAS :
-        - Seulement si aucune des deux sources ne contient la moindre information pertinente, dis :
-            "Je n'ai pas trouvé d'information spécifique sur ce point. Pour plus de précisions, n'hésitez pas à contacter la HAAC directement."
-        - Ne jamais terminer là — propose toujours une alternative (inviter à poser une autre question).
+        7. ABSENCE D'INFORMATION COMPLÈTE OU CONFUSION :
+        - Si la question porte sur un sujet institutionnel ou réglementaire de la HAAC, mais qu'après vérification rigoureuse du CONTEXTE DOCUMENTS OFFICIELS et du CONTEXTE SITE WEB HAAC, tu ne trouves ABSOLUMENT AUCUNE information concrète ou partielle pour y répondre, applique immédiatement la Règle 9 ci-dessous.
 
         8. TON ET FORMATAGE (STYLE CALL CENTER) :
         - Reste naturel, courtois et humain — évite absolument les formules robotiques.
         - Utilise les astérisques (*texte*) pour mettre en valeur les termes importants.
         - Structure tes réponses avec des points numérotés clairs ou des puces (•) pour faciliter la lecture sur WhatsApp.
         - Ne sacrifie JAMAIS l'exactitude ou l'exhaustivité juridique pour faire court. Si la liste officielle est longue, donne-la entièrement.
+
+        9. RÈGLE CRITIQUE : BASCULE ET PASSATION HUMAINE :
+        - Si et seulement si les sources fournies (FAISS et Tavily) sont muettes, insuffisantes, ou contradictoires sur la demande de l'utilisateur, tu dois impérativement générer le signal exact suivant : [TRIGGER_HANDOVER]
+        - Ne rajoute aucun commentaire, aucune phrase d'excuse ou de politesse autour. Écris UNIQUEMENT ce code secret. Le système backend se chargera de le capter pour le transférer à un humain.
 
         CONTEXTE DOCUMENTS OFFICIELS :
         {context_faiss}
@@ -286,19 +285,17 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     prompt = chatbot_config["prompt"]
     memory = chatbot_config["memory"]
 
-
     history = memory.get_formatted_history(user_id)
 
-    # 1b. Condensation contextuelle de la requête (La clé du correctif)
+    # 1b. Condensation contextuelle de la requête
     print(f"[PIPELINE] 🧠 Analyse du contexte conversationnel...")
     search_query = condense_query_with_history(llm, history, query)
 
-    # 2. Expansion + Tavily en parallèle (On utilise maintenant la 'search_query' !)
+    # 2. Expansion + Tavily en parallèle
     print(f"[PIPELINE] 🚀 Lancement parallèle : expansion + Tavily...")
     t0 = time.time()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        # On passe search_query au lieu de la query brute !
         future_queries = executor.submit(expand_query, llm, search_query)
         future_tavily  = executor.submit(search_haac_website, search_query)
 
@@ -308,7 +305,7 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     print(f"[PIPELINE] ✅ Expansion + Tavily terminés en {time.time()-t0:.2f}s")
     print(f"[TAVILY] 📄 {len(tavily_context)} caractères récupérés")
 
-    # 3. FAISS (maintenant qu'on a les variantes)
+    # 3. FAISS
     print(f"[FAISS] 🔍 Recherche dans les documents locaux...")
     t1 = time.time()
     docs = retrieve_relevant_docs(vectorstore, queries)
@@ -317,9 +314,9 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     # 4. Construction des deux contextes séparés
     context_faiss = "\n\n".join([
         f"Source: {d.metadata.get('source')}\nContenu: {d.page_content}" for d in docs
-    ]) if docs else "Aucun document pertinent trouvé dans les fichiers locaux."
+    ]) if docs else ""
 
-    context_tavily = tavily_context if tavily_context else "Aucun résultat trouvé sur haac.bj."
+    context_tavily = tavily_context if tavily_context else ""
 
     # 5. Construction du prompt final
     input_data = {
@@ -329,14 +326,15 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     }
 
     # 6. Génération
-    bot_response = llm.invoke(prompt.format(**input_data)).content
+    bot_response = llm.invoke(prompt.format(**input_data)).content.strip()
 
-    # 7. Mise à jour mémoire
-    memory.add_message("user", query, user_id)
-    memory.add_message("assistant", bot_response, user_id)
+    # 7. Mise à jour mémoire (Uniquement si ce n'est pas un trigger de handover)
+    if "[TRIGGER_HANDOVER]" not in bot_response:
+        memory.add_message("user", query, user_id)
+        memory.add_message("assistant", bot_response, user_id)
 
     # 8. Sources combinées
-    faiss_sources = list(set([doc.metadata.get('source', 'Inconnue') for doc in docs]))
+    faiss_sources = list(set([doc.metadata.get('source', 'Inconnue') for doc in docs])) if docs else []
     tavily_sources = ["haac.bj (web)"] if tavily_context else []
 
     return {

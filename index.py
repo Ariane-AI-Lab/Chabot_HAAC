@@ -1,5 +1,4 @@
 import os
-import os
 import time
 from huggingface_hub import InferenceClient
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
@@ -21,7 +20,6 @@ class HuggingFaceAPIEmbeddings(Embeddings):
         for attempt in range(3):
             try:
                 result = self.client.feature_extraction(text, model=self.model)
-                # result est un numpy array, on le convertit en liste
                 return result.tolist() if hasattr(result, 'tolist') else list(result)
             except Exception as e:
                 if "429" in str(e):
@@ -81,22 +79,28 @@ def preparer_documents(chemin_dossier):
     return final_chunks
 
 
-# 1. Préparation
-chunks = preparer_documents("markdowns")
+# ==============================================================================
+# 🔏 CE BLOC NE S'ÉXÉCUTE QUE SI ON LANCE DIRECTEMENT CE FICHIER (SCRIPT MANUEL)
+# ==============================================================================
+if __name__ == "__main__":
+    print("🚀 Lancement du script d'indexation globale manuelle...")
+    
+    # 1. Préparation
+    chunks = preparer_documents("markdowns")
 
-# 2. Récupération de la clé Hugging Face (à ajouter dans votre .env)
-hf_token = os.getenv("HF_TOKEN")
+    # 2. Récupération de la clé Hugging Face
+    hf_token = os.getenv("HF_TOKEN")
 
-if not hf_token:
-    print("❌ Erreur: HF_TOKEN manquant dans le fichier .env")
-else:
-    # 3. Initialisation des nouveaux Embeddings
-    embeddings = HuggingFaceAPIEmbeddings(api_key=hf_token)
+    if not hf_token:
+        print("❌ Erreur: HF_TOKEN manquant dans le fichier .env")
+    else:
+        # 3. Initialisation des Embeddings
+        embeddings = HuggingFaceAPIEmbeddings(api_key=hf_token)
 
-    # 4. Création de la base
-    print(f"📦 Indexation de {len(chunks)} morceaux dans FAISS via Hugging Face API...")
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+        # 4. Création de la base
+        print(f"📦 Indexation de {len(chunks)} morceaux dans FAISS via Hugging Face API...")
+        vectorstore = FAISS.from_documents(chunks, embeddings)
 
-    # 5. Sauvegarde
-    vectorstore.save_local("faiss_index_haac")
-    print("✅ Base vectorielle créée avec succès !")
+        # 5. Sauvegarde locale
+        vectorstore.save_local("faiss_index_haac")
+        print("✅ Base vectorielle créée et sauvegardée localement avec succès !")

@@ -5,7 +5,6 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 # CONSTANTES SPAM
 # ---------------------------------------------------------------------------
-
 SPAM_MAX_MESSAGES = 5
 SPAM_WINDOW_SECONDS = 60
 
@@ -15,13 +14,32 @@ SPAM_REPLY = (
 )
 
 # ---------------------------------------------------------------------------
-# CONSTANTES TRIVIAUX
+# CONFIGURATIONS ET MESSAGES DU CALL CENTER HAAC
 # ---------------------------------------------------------------------------
+FOLLOWUP_DELAY = 600  # 10 minutes en secondes
 
+FOLLOWUP_MESSAGE = (
+    "Hello! Je remarque que vous n'avez pas envoyé de message depuis un moment. "
+    "Avez-vous d'autres préoccupations concernant la réglementation des médias sur lesquelles je peux vous aider ? 😊"
+)
+
+GOODBYE_TRIGGERS = ["non", "merci", "au revoir", "bye", "stop", "no", "nothing"]
+
+GOODBYE_MESSAGE = (
+    "C'est un plaisir de vous avoir assisté ! La HAAC vous remercie pour votre confiance. 🙏\n\n"
+    "Nous restons à votre entière disposition pour toute autre préoccupation.\n"
+    "Pour plus d'informations, visitez notre portail ou écrivez-nous :\n"
+    "📧 contact@haac.bj\n"
+    "🌐 https://haac.bj\n\n"
+    "L'équipe d'assistance HAAC vous souhaite une excellente journée ! 😊"
+)
+
+# ---------------------------------------------------------------------------
+# CONSTANTES MESSAGES TRIVIAUX
+# ---------------------------------------------------------------------------
 GREETING_PATTERNS = [
     r"^\s*(bonjour|bonsoir|salut|hello|hi|hey|coucou|allo|allô)\s*[!?.]*\s*$",
 ]
-
 GREETING_COMPILED = [re.compile(p, re.IGNORECASE | re.UNICODE) for p in GREETING_PATTERNS]
 
 GREETING_REPLY = (
@@ -38,9 +56,9 @@ TRIVIAL_PATTERNS = [
     r"^\s*.{0,2}\s*$",
     r"^\s*(test|testing|essai|123|ping)\s*[!?.]*\s*$",
 ]
-
 TRIVIAL_COMPILED = [re.compile(p, re.IGNORECASE | re.UNICODE) for p in TRIVIAL_PATTERNS]
 
+# 📝 PROMPTS LLM (Trivia & Clôture)
 TRIVIAL_RESPONSE_PROMPT = """Tu es l'assistant officiel de la HAAC (Haute Autorité de l'Audiovisuel et de la Communication du Bénin).
 
 Un utilisateur t'envoie ce message : "{text}"
@@ -50,10 +68,9 @@ Ne te présente pas sauf si c'est une salutation d'ouverture. Réponds juste de 
 
 Réponds UNIQUEMENT avec la réponse courte, rien d'autre."""
 
-# AJOUT DE L'HISTORIQUE DANS LE PROMPT POUR LES CAS AMBIGUS
 TRIVIAL_CLASSIFY_PROMPT = """Tu es l'assistant officiel de la HAAC (Haute Autorité de l'Audiovisuel et de la Communication du Bénin).
 
-Tu dois analyser le message actuel de l'utilisateur en prenant en compte l'historique de la conversation.
+Tu devez analyser le message actuel de l'utilisateur en prenant en compte l'historique de la conversation.
 
 HISTORIQUE DE LA CONVERSATION :
 {history}
@@ -66,11 +83,21 @@ Ce message contient-il une vraie question, une demande d'information, ou une RÉ
 
 Réponds UNIQUEMENT avec QUESTION ou avec la réponse courte, rien d'autre."""
 
+CLOTURE_CLASSIFY_PROMPT = """Analyse le message court d'un utilisateur de chatbot et détermine s'il exprime la fin de la discussion (intention de dire au revoir, de remercier pour clore, ou d'indiquer qu'il n'a plus de questions).
+
+MESSAGE DE L'UTILISATEUR : "{text}"
+
+Réponds UNIQUEMENT par le mot OUI si l'utilisateur veut clore la discussion.
+Réponds UNIQUEMENT par le mot NON si l'utilisateur pose une question ou attend une suite.
+
+Exemples de OUI : "non c'est bon merci", "c'est tout pour moi", "merci bien", "fin", "plus de questions", "merci bonsoir".
+Exemples de NON : "non, je veux plutôt savoir...", "merci mais qu'en est-il de...", "c'est bon pour la carte, et pour la radio ?".
+
+Réponse (OUI ou NON) :"""
 
 # ---------------------------------------------------------------------------
 # ANTI-SPAM
 # ---------------------------------------------------------------------------
-
 user_message_times: dict[str, list[float]] = defaultdict(list)
 
 def is_rate_limited(sender_id: str) -> bool:
@@ -85,16 +112,22 @@ def is_rate_limited(sender_id: str) -> bool:
     user_message_times[sender_id].append(now)
     return False
 
-
 # ---------------------------------------------------------------------------
-# DÉTECTION ET RÉPONSE CONTEXTUELLE AUX MESSAGES TRIVIAUX
+# ANALYSE ET FILTRES DES MESSAGES
 # ---------------------------------------------------------------------------
+def check_if_goodbye_llm(llm, text: str) -> bool:
+    """Utilise le LLM pour détecter si l'utilisateur souhaite clore la conversation."""
+    if llm is None:
+        return False
+    try:
+        response = llm.invoke(CLOTURE_CLASSIFY_PROMPT.format(text=text)).content.strip().upper()
+        return "OUI" in response
+    except Exception as e:
+        print(f"[CLÔTURE] ⚠️ Erreur LLM classification clôture : {e}")
+        return False
 
 def handle_trivial(text: str, llm=None, history: str = None) -> str | None:
-    """
-    Retourne une réponse si le message est purement trivial, sinon None.
-    Prend désormais en compte l'historique pour ne pas bloquer les choix de l'utilisateur.
-    """
+    """Retourne une réponse si le message est purement trivial, sinon None."""
     # Étape 1a : Salutations directes
     if any(p.match(text) for p in GREETING_COMPILED):
         print(f"[FILTER] 👋 Salutation détectée : '{text[:50]}'")
@@ -113,28 +146,23 @@ def handle_trivial(text: str, llm=None, history: str = None) -> str | None:
             print(f"[FILTER] ⚠️ Erreur LLM réponse triviale : {e}")
             return "Très bien ! Je reste disponible si vous avez des questions. 😊"
 
-    # --- SÉCURITÉ CONTEXTUELLE ---
-    # Si l'utilisateur a déjà une conversation engagée (historique existant) 
-    # et que la phrase n'a pas matché les pures banalités du dessus, on BYPASSE 
-    # l'étape 2 pour l'envoyer directement au pipeline RAG.
+    # Sécurité contextuelle : By-pass si conversation active
     if history and "Aucune conversation précédente" not in history and len(history.strip()) > 0:
         print(f"[FILTER] 🧠 Session active détectée. Message envoyé directement au RAG.")
         return None
 
-    # Étape 2 : Cas ambigus (uniquement pour le TOUT PREMIER message de la session)
+    # Étape 2 : Cas ambigus (uniquement pour le premier échange de la session)
     if llm is None:
         return None
 
     try:
-        # On passe l'historique (ou une chaîne vide) au prompt
         hist_str = history if history else "Aucun échange précédent."
         formatted_prompt = TRIVIAL_CLASSIFY_PROMPT.format(text=text, history=hist_str)
-        
         response = llm.invoke(formatted_prompt).content.strip()
         
         if response.upper() == "QUESTION":
             print(f"[FILTER] ✅ Message pertinent (LLM) : '{text[:50]}'")
-            return None  # → pipeline RAG normal
+            return None
             
         print(f"[FILTER] ⚠️ Trivial (LLM) : '{text[:50]}' → '{response[:80]}'")
         return response
