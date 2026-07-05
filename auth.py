@@ -18,10 +18,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 def hasher_mot_de_passe(mot_de_passe: str) -> str:
-    return pwd_context.hash(mot_de_passe)
+    return pwd_context.hash(mot_de_passe[:72])
 
 def verifier_mot_de_passe(mot_de_passe: str, hash: str) -> bool:
-    return pwd_context.verify(mot_de_passe, hash)
+    return pwd_context.verify(mot_de_passe[:72], hash)
 
 def creer_token(data: dict) -> str:
     to_encode = data.copy()
