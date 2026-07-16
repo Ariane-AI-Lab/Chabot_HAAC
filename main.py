@@ -1029,6 +1029,15 @@ async def get_statistiques(
         tronc = func.date_trunc('month', Conversation.cree_le).label("jour")
         format_str = "%m/%Y"
 
+    if periode == "aujourd'hui":
+        date_debut = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif periode == "semaine":
+        date_debut = maintenant - timedelta(days=7)
+    elif periode == "mois":
+        date_debut = maintenant - timedelta(days=30)
+    else:  # "tout"
+        date_debut = datetime(2000, 1, 1)
+
     filtre_periode = Session.cree_le >= date_debut
 
     result_par_jour = await db.execute(
