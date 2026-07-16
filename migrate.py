@@ -97,6 +97,58 @@ async def migrate():
             );
         """))
 
-        print("✅ Migration réussie !")
+        # 6. Ajouter messages_ia si pas encore créée
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS messages_ia (
+                id         SERIAL PRIMARY KEY,
+                phone      VARCHAR(20) NOT NULL,
+                question   TEXT NOT NULL,
+                reponse    TEXT NOT NULL,
+                sources    TEXT,
+                duree_ms   INTEGER,
+                a_handover BOOLEAN DEFAULT FALSE,
+                envoye_le  TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_ia_phone 
+                ON messages_ia(phone);
+            CREATE INDEX IF NOT EXISTS idx_messages_ia_envoye_le 
+                ON messages_ia(envoye_le);
+        """))
+        await conn.execute(text("""
+            ALTER TABLE messages_ia 
+            ADD COLUMN IF NOT EXISTS problematique_id INTEGER 
+                REFERENCES problematiques(id),
+            ADD COLUMN IF NOT EXISTS problematique_libelle VARCHAR(200);
+        """))
+
+        # 7. Ajouter sessions_ia si pas encore créée
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS sessions_ia (
+                id                    SERIAL PRIMARY KEY,
+                phone                 VARCHAR(20) NOT NULL,
+                statut                VARCHAR(20) DEFAULT 'EN_COURS',
+                problematique_id      INTEGER REFERENCES problematiques(id),
+                problematique_libelle VARCHAR(200),
+                nb_echanges           INTEGER DEFAULT 0,
+                debut_le              TIMESTAMP DEFAULT NOW(),
+                cloturee_le           TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_ia_phone 
+                ON sessions_ia(phone);
+
+        
+            CREATE TABLE IF NOT EXISTS messages_session_ia (
+                id         SERIAL PRIMARY KEY,
+                session_id INTEGER NOT NULL REFERENCES sessions_ia(id),
+                phone      VARCHAR(20) NOT NULL,
+                expediteur VARCHAR(10) NOT NULL,
+                texte      TEXT NOT NULL,
+                duree_ms   INTEGER,
+                envoye_le  TIMESTAMP DEFAULT NOW()
+            );
+        """))
+
+
+        print("✅ Table messages_ia créée")
 
 asyncio.run(migrate())

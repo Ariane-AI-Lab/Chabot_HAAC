@@ -54,6 +54,46 @@ class Message(Base):
     nom_agent  = Column(String(100), nullable=True)
     envoye_le  = Column(DateTime, server_default=func.now())
 
+class MessageIA(Base):
+    __tablename__ = "messages_ia"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    phone           = Column(String(20), nullable=False, index=True)
+    question        = Column(Text, nullable=False)
+    reponse         = Column(Text, nullable=False)
+    sources         = Column(Text, nullable=True)
+    duree_ms        = Column(Integer, nullable=True)
+    a_handover      = Column(Boolean, default=False)
+    problematique_id = Column(Integer, ForeignKey("problematiques.id"), nullable=True)
+    problematique_libelle = Column(String(200), nullable=True)  # dénormalisé pour simplicité
+    envoye_le       = Column(DateTime, server_default=func.now())
+
+
+class MessageSessionIA(Base):
+    __tablename__ = "messages_session_ia"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    session_id  = Column(Integer, ForeignKey("sessions_ia.id"), nullable=False)
+    phone       = Column(String(20), nullable=False)
+    expediteur  = Column(String(10), nullable=False)  # "client" ou "ia"
+    texte       = Column(Text, nullable=False)
+    duree_ms    = Column(Integer, nullable=True)
+    envoye_le   = Column(DateTime, server_default=func.now())
+
+
+class SessionIA(Base):
+    __tablename__ = "sessions_ia"
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    phone                 = Column(String(20), nullable=False, index=True)
+    statut                = Column(String(20), default="EN_COURS")
+    # "EN_COURS" | "CLOTUREE_AU_REVOIR" | "CLOTUREE_TIMEOUT"
+    problematique_id      = Column(Integer, ForeignKey("problematiques.id"), nullable=True)
+    problematique_libelle = Column(String(200), nullable=True)
+    nb_echanges           = Column(Integer, default=0)
+    debut_le              = Column(DateTime, server_default=func.now())
+    cloturee_le           = Column(DateTime, nullable=True)
+
 
 class Problematique(Base):
     __tablename__ = "problematiques"

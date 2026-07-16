@@ -1,6 +1,7 @@
 import requests
 import re
 import os
+import json
 import time
 import asyncio
 import mammoth
@@ -22,7 +23,7 @@ from langchain_core.documents import Document
 from index import HuggingFaceAPIEmbeddings, preparer_documents
 from retrieve import configurer_chatbot, poser_question_avec_memoire
 from database import engine, get_db, Base, AsyncSessionLocal
-from models import Agent, Conversation, Message, Problematique, Session
+from models import Agent, Conversation, Message, Problematique, Session, MessageIA, MessageSessionIA, SessionIA
 from sqlalchemy import select, update, func, and_
 from datetime import datetime, timedelta
 from filters import (
@@ -71,6 +72,7 @@ ADMIN_NOM = os.getenv("ADMIN_NOM", "Admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://ton-dashboard.com")
 
+
 if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID or not VERIFY_TOKEN:
     raise ValueError("Variables d'environnement WhatsApp manquantes dans le fichier .env")
 
@@ -111,6 +113,9 @@ processed_message_ids: set[str] = set()
 MAX_PROCESSED_IDS = 2000
 last_message_time: dict[str, float] = {}
 followup_tasks: dict[str, asyncio.Task] = {}
+SESSIONS_IA_ACTIVES: dict[str, int] = {}
+TIMEOUT_TASKS: dict[str, asyncio.Task] = {}
+TIMEOUT_CLOTURE = 600  
 
 
 class QuestionRequest(BaseModel):
@@ -210,20 +215,73 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
         print(f"[EMAIL] ❌ Échec envoi email : {e}")
 
 
+async def classifier_session_ia(contexte_conversation: str) -> tuple[int | None, str | None]:
+    """Classifie une conversation IA complète dans une problématique."""
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Problematique).order_by(Problematique.libelle.asc())
+            )
+            problematiques = result.scalars().all()
+
+        if not problematiques:
+            return None, None
+
+        libelles_map = {p.libelle: p.id for p in problematiques}
+
+        prompt = f"""Tu es un assistant de classification pour la HAAC 
+            (Haute Autorité de l'Audiovisuel et de la Communication du Bénin).
+
+            Voici les catégories de problématiques officielles :
+            {chr(10).join(f"- {lib}" for lib in libelles_map.keys())}
+
+            Voici une conversation complète entre un citoyen et le chatbot HAAC :
+            {contexte_conversation[:1500]}
+
+            Dans quelle catégorie de problématique cette conversation s'inscrit-elle ?
+            Réponds UNIQUEMENT avec le nom exact de la catégorie, rien d'autre."""
+
+        loop = asyncio.get_event_loop()
+        llm = chatbot["llm"]
+        reponse_llm = await loop.run_in_executor(None, llm.invoke, prompt)
+
+        libelle = reponse_llm.content.strip() \
+            if hasattr(reponse_llm, 'content') else str(reponse_llm).strip()
+
+        # Correspondance exacte
+        if libelle in libelles_map:
+            return libelles_map[libelle], libelle
+
+        # Correspondance partielle
+        for lib in libelles_map:
+            if lib.lower() in libelle.lower() or libelle.lower() in lib.lower():
+                return libelles_map[lib], lib
+
+        # Fallback première problématique
+        first = problematiques[0]
+        return first.id, first.libelle
+
+    except Exception as e:
+        print(f"[CLASSIFIER] ❌ Erreur : {e}")
+        return None, None
+
+
 async def wait_and_send_followup(sender_id: str):
+    """Attend puis envoie une relance. Si pas de réponse, clôture la session."""
     try:
         await asyncio.sleep(FOLLOWUP_DELAY)
 
+        # Vérifier si conversation humaine active
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(Session).where(
-                    Session.phone == sender_id,
-                    Session.statut.in_(["HUMAIN", "PRISE"])
+                select(Conversation).where(
+                    Conversation.phone == sender_id,
+                    Conversation.statut.in_(["HUMAIN", "PRISE"])
                 )
             )
-            session_active = result.scalar_one_or_none()
+            conv = result.scalar_one_or_none()
 
-        if session_active:
+        if conv:
             return
 
         current_time = time.time()
@@ -231,8 +289,40 @@ async def wait_and_send_followup(sender_id: str):
 
         if elapsed >= FOLLOWUP_DELAY:
             send_whatsapp_message(sender_id, FOLLOWUP_MESSAGE)
-            print(f"[FOLLOWUP] 📤 Relance transmise à {sender_id}")
+            print(f"[FOLLOWUP] 📤 Relance envoyée à {sender_id}")
             last_message_time[sender_id] = current_time
+
+            # Lancer le timer de clôture par timeout
+            if sender_id in SESSIONS_IA_ACTIVES:
+                TIMEOUT_TASKS[sender_id] = asyncio.create_task(
+                    attendre_et_cloturer_timeout(sender_id)
+                )
+
+    except asyncio.CancelledError:
+        pass
+
+
+async def attendre_et_cloturer_timeout(sender_id: str):
+    """
+    Attend TIMEOUT_CLOTURE secondes après la relance.
+    Si le client ne répond toujours pas, envoie le message
+    de clôture et clôture la session.
+    """
+    try:
+        await asyncio.sleep(TIMEOUT_CLOTURE)
+
+        # Vérifier qu'il n'y a pas eu de réponse entre-temps
+        current_time = time.time()
+        elapsed = current_time - last_message_time.get(sender_id, 0)
+
+        if elapsed >= TIMEOUT_CLOTURE:
+            # Envoyer le message de clôture
+            send_whatsapp_message(sender_id, GOODBYE_MESSAGE)
+            print(f"[TIMEOUT] 🔒 Session clôturée par timeout pour {sender_id}")
+
+            # Clôturer la session IA
+            await cloturer_session_ia(sender_id, "CLOTUREE_TIMEOUT")
+
     except asyncio.CancelledError:
         pass
 
@@ -245,80 +335,163 @@ def reset_followup_timer(sender_id: str):
     followup_tasks[sender_id] = asyncio.create_task(wait_and_send_followup(sender_id))
 
 
+async def cloturer_session_ia(
+    sender_id: str,
+    raison: str = "CLOTUREE_AU_REVOIR"
+):
+    """
+    Clôture une session IA :
+    1. Récupère tous les messages de la session
+    2. Classifie via Gemini
+    3. Enregistre en BD
+    4. Nettoie les timers
+    """
+    session_id = SESSIONS_IA_ACTIVES.get(sender_id)
+    if not session_id:
+        return
+
+    try:
+        async with AsyncSessionLocal() as db:
+            # Récupérer la session
+            result = await db.execute(
+                select(SessionIA).where(SessionIA.id == session_id)
+            )
+            session = result.scalar_one_or_none()
+            if not session or session.statut != "EN_COURS":
+                return
+
+            # Récupérer tous les messages de la session
+            result_msgs = await db.execute(
+                select(MessageSessionIA)
+                .where(MessageSessionIA.session_id == session_id)
+                .order_by(MessageSessionIA.envoye_le.asc())
+            )
+            messages = result_msgs.scalars().all()
+
+            # Classifier si on a des messages
+            prob_id, prob_libelle = None, None
+            if messages:
+                # Construire le contexte de la conversation
+                contexte = "\n".join([
+                    f"{m.expediteur.upper()}: {m.texte}"
+                    for m in messages
+                ])
+                prob_id, prob_libelle = await classifier_session_ia(contexte)
+
+            # Mettre à jour la session
+            session.statut         = raison
+            session.cloturee_le    = datetime.utcnow()
+            session.problematique_id      = prob_id
+            session.problematique_libelle = prob_libelle
+            await db.commit()
+
+        print(f"[SESSION IA] ✅ Session {session_id} clôturée ({raison}) → {prob_libelle}")
+
+    except Exception as e:
+        print(f"[SESSION IA] ❌ Erreur clôture : {e}")
+    finally:
+        # Nettoyer la mémoire
+        SESSIONS_IA_ACTIVES.pop(sender_id, None)
+        if sender_id in TIMEOUT_TASKS:
+            TIMEOUT_TASKS[sender_id].cancel()
+            TIMEOUT_TASKS.pop(sender_id, None)
+
+
 async def process_whatsapp_pipeline(sender_id: str, user_text: str):
     try:
         if is_rate_limited(sender_id):
             send_whatsapp_message(sender_id, SPAM_REPLY)
             return
 
-        # Chercher session active (HUMAIN ou PRISE)
+        # Vérifier si conversation humaine active en BD
         async with AsyncSessionLocal() as db:
-            session_result = await db.execute(
-                select(Session)
-                .where(
-                    Session.phone == sender_id,
-                    Session.statut.in_(["HUMAIN", "PRISE"])
+            result = await db.execute(
+                select(Conversation).where(
+                    Conversation.phone == sender_id,
+                    Conversation.statut.in_(["HUMAIN", "PRISE"])
                 )
-                .order_by(Session.cree_le.desc())
             )
-            session_active = session_result.scalar_one_or_none()
+            conv = result.scalar_one_or_none()
 
-        # Mode humain actif — stocker le message et sortir
-        if session_active:
-            print(f"[HANDOVER] 👤 Mode Humain actif pour {sender_id}.")
+        if conv:
             async with AsyncSessionLocal() as db:
+                result_session = await db.execute(
+                    select(Session).where(
+                        Session.phone == sender_id,
+                        Session.statut.in_(["HUMAIN", "PRISE"])
+                    ).order_by(Session.cree_le.desc()).limit(1)
+                )
+                session_active = result_session.scalar_one_or_none()
+
                 db.add(Message(
                     phone=sender_id,
-                    session_id=session_active.id,
+                    session_id=session_active.id if session_active else None,
                     expediteur="client",
                     texte=user_text
                 ))
                 await db.commit()
             return
 
-        # Interception note client
+        # Vérifier si en attente de note client
         async with AsyncSessionLocal() as db:
-            note_session_result = await db.execute(
-                select(Session)
-                .where(
+            result_note = await db.execute(
+                select(Session).where(
                     Session.phone == sender_id,
                     Session.en_attente_note == True
-                )
-                .order_by(Session.cree_le.desc())
+                ).order_by(Session.cloturee_le.desc()).limit(1)
             )
-            note_session = note_session_result.scalar_one_or_none()
+            session_note = result_note.scalar_one_or_none()
 
-        if note_session:
-            note_text = user_text.strip()
-            if note_text in ["1", "2", "3", "4", "5"]:
+        note_text = user_text.strip().lower()
+        if session_note:
+            NOTE_MAP = {
+                "1": 1, "très insatisfait": 1, "tres insatisfait": 1,
+                "2": 2, "insatisfait": 2,
+                "3": 3, "moyen": 3, "neutre": 3,
+                "4": 4, "satisfait": 4,
+                "5": 5, "très satisfait": 5, "tres satisfait": 5,
+            }
+            note_val = NOTE_MAP.get(note_text)
+            if note_val:
                 async with AsyncSessionLocal() as db:
-                    s = await db.get(Session, note_session.id)
-                    if s:
-                        s.note_client = int(note_text)
-                        s.en_attente_note = False
-                        await db.commit()
-                send_whatsapp_message(sender_id, (
+                    session_note.note_client = note_val
+                    session_note.en_attente_note = False
+                    db.add(session_note)
+                    await db.commit()
+                send_whatsapp_message(sender_id,
                     "🙏 *Merci pour votre retour !*\n\n"
-                    "Votre avis nous aide à améliorer nos services.\n"
-                    "N'hésitez pas à nous recontacter si vous avez d'autres questions."
-                ))
+                    "Votre avis nous aide à améliorer nos services.")
                 return
             else:
-                send_whatsapp_message(
-                    sender_id,
-                    "Merci de répondre avec un chiffre entre 1 et 5 pour noter notre service. 😊"
-                )
+                send_whatsapp_message(sender_id,
+                    "Merci de répondre avec :\n"
+                    "• *Très insatisfait* • *Insatisfait*\n"
+                    "• *Moyen* • *Satisfait* • *Très satisfait*")
                 return
 
         cleaned_text = user_text.strip().lower().replace(".", "").replace("!", "")
-        is_goodbye = (cleaned_text in GOODBYE_TRIGGERS) or check_if_goodbye_llm(chatbot["llm"], user_text)
+
+        # Clôture par au revoir
+        is_goodbye = (cleaned_text in GOODBYE_TRIGGERS) or \
+                     check_if_goodbye_llm(chatbot["llm"], user_text)
 
         if is_goodbye:
             send_whatsapp_message(sender_id, GOODBYE_MESSAGE)
+
+            # Clôturer la session IA si active
+            if sender_id in SESSIONS_IA_ACTIVES:
+                asyncio.create_task(
+                    cloturer_session_ia(sender_id, "CLOTUREE_AU_REVOIR")
+                )
+
+            # Annuler les timers
             if sender_id in followup_tasks:
                 followup_tasks[sender_id].cancel()
+            if sender_id in TIMEOUT_TASKS:
+                TIMEOUT_TASKS[sender_id].cancel()
             return
 
+        # Messages triviaux
         history = chatbot["memory"].get_formatted_history(sender_id)
         trivial_response = handle_trivial(user_text, llm=chatbot["llm"], history=history)
         if trivial_response:
@@ -326,69 +499,120 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
             reset_followup_timer(sender_id)
             return
 
-        print(f"[PIPELINE] 🔍 Analyse de la requête pour {sender_id}...")
+        # Pipeline RAG
         t0 = time.time()
         result = poser_question_avec_memoire(chatbot, user_text, user_id=sender_id)
-        print(f"[PIPELINE] ✅ Synthèse achevée en {time.time() - t0:.2f}s")
-
         bot_answer_raw = result.get('response', '')
 
+        # Handover
         if "[TRIGGER_HANDOVER]" in bot_answer_raw:
-            print(f"[HANDOVER] 🔄 Signal détecté pour {sender_id}.")
+            # Clôturer session IA avant de passer en humain
+            if sender_id in SESSIONS_IA_ACTIVES:
+                asyncio.create_task(
+                    cloturer_session_ia(sender_id, "CLOTUREE_AU_REVOIR")
+                )
 
             async with AsyncSessionLocal() as db:
-                # Vérifier s'il y a déjà une session ACTIVE
-                result_active = await db.execute(
-                    select(Session).where(
-                        Session.phone == sender_id,
-                        Session.statut.in_(["HUMAIN", "PRISE"])
-                    )
+                # Créer la session humaine (celle que le dashboard agent affiche)
+                nouvelle_session = Session(phone=sender_id, statut="HUMAIN")
+                db.add(nouvelle_session)
+                await db.flush()
+
+                db.add(Message(
+                    phone=sender_id,
+                    session_id=nouvelle_session.id,
+                    expediteur="client",
+                    texte=user_text
+                ))
+
+                # Marquer/mettre à jour le pointeur de statut global par numéro
+                conv_existante = await db.execute(
+                    select(Conversation).where(Conversation.phone == sender_id)
                 )
-                session_existante = result_active.scalar_one_or_none()
-
-                if not session_existante:
-                    # Créer une NOUVELLE session
-                    nouvelle_session = Session(
-                        phone=sender_id,
-                        statut="HUMAIN"
-                    )
-                    db.add(nouvelle_session)
-                    await db.flush()
-
-                    db.add(Message(
-                        phone=sender_id,
-                        session_id=nouvelle_session.id,
-                        expediteur="client",
-                        texte=user_text
-                    ))
+                conv_ex = conv_existante.scalar_one_or_none()
+                if not conv_ex:
+                    db.add(Conversation(phone=sender_id, statut="HUMAIN"))
                 else:
-                    db.add(Message(
-                        phone=sender_id,
-                        session_id=session_existante.id,
-                        expediteur="client",
-                        texte=user_text
-                    ))
+                    conv_ex.statut = "HUMAIN"
 
                 await db.commit()
 
-            msg_attente = (
-                "Je ne parviens pas à trouver une réponse officielle et précise à votre demande dans mes documents.\n\n"
-                "⏳ *Je vous mets immédiatement en relation avec un agent de la HAAC* qui va prendre le relais directement dans cette discussion. Veuillez patienter un instant..."
-            )
-            send_whatsapp_message(sender_id, msg_attente)
+            send_whatsapp_message(sender_id,
+                "Je ne parviens pas à trouver une réponse officielle et précise "
+                "à votre demande dans mes documents.\n\n"
+                "⏳ *Je vous mets immédiatement en relation avec un agent de la HAAC*...")
             await notifier_agents_par_email(sender_id, user_text)
 
             if sender_id in followup_tasks:
                 followup_tasks[sender_id].cancel()
             return
 
+        # Réponse normale de l'IA
         bot_answer = markdown_to_whatsapp(bot_answer_raw)
         send_whatsapp_message(sender_id, bot_answer)
+
+        # Créer ou mettre à jour la session IA active
+        if sender_id not in SESSIONS_IA_ACTIVES:
+            async with AsyncSessionLocal() as db:
+                nouvelle_session = SessionIA(phone=sender_id, statut="EN_COURS")
+                db.add(nouvelle_session)
+                await db.flush()
+                session_id = nouvelle_session.id
+
+                # Ajouter les deux messages (question + réponse)
+                db.add(MessageSessionIA(
+                    session_id=session_id,
+                    phone=sender_id,
+                    expediteur="client",
+                    texte=user_text
+                ))
+                db.add(MessageSessionIA(
+                    session_id=session_id,
+                    phone=sender_id,
+                    expediteur="ia",
+                    texte=bot_answer_raw,
+                    duree_ms=int((time.time() - t0) * 1000)
+                ))
+                await db.commit()
+
+            SESSIONS_IA_ACTIVES[sender_id] = session_id
+        else:
+            # Ajouter à la session existante
+            session_id = SESSIONS_IA_ACTIVES[sender_id]
+            async with AsyncSessionLocal() as db:
+                db.add(MessageSessionIA(
+                    session_id=session_id,
+                    phone=sender_id,
+                    expediteur="client",
+                    texte=user_text
+                ))
+                db.add(MessageSessionIA(
+                    session_id=session_id,
+                    phone=sender_id,
+                    expediteur="ia",
+                    texte=bot_answer_raw,
+                    duree_ms=int((time.time() - t0) * 1000)
+                ))
+
+                # Incrémenter le compteur d'échanges
+                await db.execute(
+                    update(SessionIA)
+                    .where(SessionIA.id == session_id)
+                    .values(nb_echanges=SessionIA.nb_echanges + 1)
+                )
+                await db.commit()
+
+        # Gérer les timers de relance et timeout
         reset_followup_timer(sender_id)
 
     except Exception as e:
         print(f"[PIPELINE-ERREUR] ❌ Dysfonctionnement : {e}")
-        send_whatsapp_message(sender_id, "Navré, mes systèmes rencontrent une surcharge temporaire. Veuillez reformuler.")
+        send_whatsapp_message(sender_id,
+            "Navré, mes systèmes rencontrent une surcharge temporaire. "
+            "Veuillez reformuler.")
+
+
+# =============================================================================================
 
 
 @app.get("/webhook")
@@ -575,6 +799,15 @@ async def close_human_session(
     s.statut = "CLOTUREE"
     s.agent = None
     s.en_attente_note = True
+
+    # Libérer le numéro (le chatbot IA peut reprendre la main)
+    result_conv = await db.execute(
+        select(Conversation).where(Conversation.phone == s.phone)
+    )
+    conv = result_conv.scalar_one_or_none()
+    if conv:
+        conv.statut = "IA"
+
     await db.commit()
 
     send_whatsapp_message(s.phone, GOODBYE_MESSAGE)
@@ -582,7 +815,7 @@ async def close_human_session(
         "⭐ *Votre avis compte !*\n\n"
         "Comment évaluez-vous la qualité de l'assistance reçue ?\n\n"
         "Répondez avec un chiffre de 1 à 5 :\n"
-        "1 — Très insatisfait\n2 — Insatisfait\n3 — Neutre\n4 — Satisfait\n5 — Très satisfait ⭐⭐⭐⭐⭐"
+        "1 — ⭐ Très insatisfait\n2 — ⭐⭐ Insatisfait\n3 — ⭐⭐⭐ Moyen\n4 — ⭐⭐⭐⭐ Satisfait\n5 — ⭐⭐⭐⭐⭐ Très satisfait"
     ))
 
     print(f"[HANDOVER] 🚪 Session {session_id} close pour {s.phone} par {agent.nom}.")
@@ -787,20 +1020,29 @@ async def get_statistiques(
     """Retourne des statistiques détaillées filtrées par période."""
     maintenant = datetime.utcnow()
     if periode == "aujourd'hui":
-        date_debut = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif periode == "semaine":
-        date_debut = (maintenant - timedelta(days=7)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-    elif periode == "mois":
-        date_debut = (maintenant - timedelta(days=30)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-    else:
-        date_debut = datetime(2000, 1, 1)
+        tronc = func.date_trunc('hour', Conversation.cree_le).label("jour")
+        format_str = "%Hh"
+    elif periode in ("semaine", "mois"):
+        tronc = func.date_trunc('day', Conversation.cree_le).label("jour")
+        format_str = "%d/%m"
+    else:  # "tout"
+        tronc = func.date_trunc('month', Conversation.cree_le).label("jour")
+        format_str = "%m/%Y"
 
     filtre_periode = Session.cree_le >= date_debut
 
+    result_par_jour = await db.execute(
+        select(
+            tronc,
+            func.count(Conversation.phone).label("total")
+        )
+        .where(filtre_periode)
+        .group_by(tronc)
+        .order_by(tronc)
+    )
+    par_jour = result_par_jour.all()
+
+    
     r_total = await db.execute(select(func.count(Session.id)).where(filtre_periode))
     total_conversations = r_total.scalar() or 0
 
@@ -903,8 +1145,181 @@ async def get_statistiques(
         ],
         "problematiques": [{"label": r.problematique, "total": r.total} for r in problematiques],
         "conversations_par_jour": [{"jour": r.jour.strftime("%d/%m"), "total": r.total} for r in par_jour],
-        "repartition_notes": repartition_notes
+        "repartition_notes": repartition_notes,
+        "conversations_par_jour": [
+            {
+                "jour": r.jour.strftime(format_str),
+                "total": r.total
+            }
+            for r in par_jour
+        ]
+
     }
+
+
+@app.get("/admin/stats-ia")
+async def get_stats_ia(
+    periode: str = "semaine",
+    db: AsyncSession = Depends(get_db),
+    admin: Agent = Depends(get_admin_connecte)
+):
+    maintenant = datetime.utcnow()
+    if periode == "aujourd'hui":
+        date_debut = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
+        tronc = func.date_trunc('hour', SessionIA.debut_le).label("periode")
+        format_str = "%Hh"
+    elif periode == "semaine":
+        date_debut = maintenant - timedelta(days=7)
+        tronc = func.date_trunc('day', SessionIA.debut_le).label("periode")
+        format_str = "%d/%m"
+    elif periode == "mois":
+        date_debut = maintenant - timedelta(days=30)
+        tronc = func.date_trunc('day', SessionIA.debut_le).label("periode")
+        format_str = "%d/%m"
+    else:
+        date_debut = datetime(2000, 1, 1)
+        tronc = func.date_trunc('month', SessionIA.debut_le).label("periode")
+        format_str = "%m/%Y"
+
+    filtre = and_(SessionIA.debut_le >= date_debut, SessionIA.statut != "EN_COURS")
+
+    # Total sessions IA clôturées
+    r1 = await db.execute(select(func.count(SessionIA.id)).where(filtre))
+    total_sessions = r1.scalar() or 0
+
+    # Sessions clôturées vers handover
+    r2 = await db.execute(
+        select(func.count(Session.id))
+        .where(Session.cree_le >= date_debut)
+    )
+    total_handovers = r2.scalar() or 0
+
+    # Taux de handover
+    total_general = total_sessions + total_handovers
+    taux_handover = round((total_handovers / total_general * 100), 1) \
+        if total_general > 0 else 0
+
+    # Temps de réponse moyen (depuis MessageSessionIA)
+    r3 = await db.execute(
+        select(func.avg(MessageSessionIA.duree_ms))
+        .join(SessionIA, MessageSessionIA.session_id == SessionIA.id)
+        .where(
+            and_(
+                SessionIA.debut_le >= date_debut,
+                MessageSessionIA.expediteur == "ia",
+                MessageSessionIA.duree_ms != None
+            )
+        )
+    )
+    duree_moy = r3.scalar()
+
+    # Sessions par période
+    r4 = await db.execute(
+        select(tronc, func.count(SessionIA.id).label("total"))
+        .where(filtre)
+        .group_by(tronc)
+        .order_by(tronc)
+    )
+    par_periode = r4.all()
+
+    return {
+        "periode": periode,
+        "total_sessions_ia": total_sessions,
+        "total_handovers": total_handovers,
+        "taux_handover_pct": taux_handover,
+        "duree_reponse_moy_sec": round(duree_moy / 1000, 2) if duree_moy else None,
+        "sessions_par_periode": [
+            {"jour": r.periode.strftime(format_str), "total": r.total}
+            for r in par_periode
+        ]
+    }
+
+
+@app.get("/admin/questions-frequentes")
+async def get_questions_frequentes(
+    limite: int = 10,
+    db: AsyncSession = Depends(get_db),
+    admin: Agent = Depends(get_admin_connecte)
+):
+    """Retourne les dernières questions posées au chatbot IA."""
+    result = await db.execute(
+        select(MessageIA)
+        .where(MessageIA.a_handover == False)
+        .order_by(MessageIA.envoye_le.desc())
+        .limit(limite)
+    )
+    messages = result.scalars().all()
+
+    return {
+        "questions": [
+            {
+                "phone": m.phone,
+                "question": m.question,
+                "duree_sec": round(m.duree_ms / 1000, 2) if m.duree_ms else None,
+                "date": m.envoye_le.strftime("%d/%m/%Y à %H:%M") if m.envoye_le else ""
+            }
+            for m in messages
+        ]
+    }
+
+@app.get("/admin/themes-frequents")
+async def get_themes_frequents(
+    periode: str = "semaine",
+    db: AsyncSession = Depends(get_db),
+    admin: Agent = Depends(get_admin_connecte)
+):
+    maintenant = datetime.utcnow()
+    if periode == "aujourd'hui":
+        date_debut = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif periode == "semaine":
+        date_debut = maintenant - timedelta(days=7)
+    elif periode == "mois":
+        date_debut = maintenant - timedelta(days=30)
+    else:
+        date_debut = datetime(2000, 1, 1)
+
+    # Toutes les problématiques
+    result_prob = await db.execute(
+        select(Problematique).order_by(Problematique.libelle.asc())
+    )
+    problematiques = result_prob.scalars().all()
+
+    # Compter les sessions IA clôturées par problématique
+    result_counts = await db.execute(
+        select(
+            SessionIA.problematique_libelle,
+            func.count(SessionIA.id).label("nombre")
+        )
+        .where(
+            and_(
+                SessionIA.cloturee_le >= date_debut,
+                SessionIA.statut != "EN_COURS",
+                SessionIA.problematique_libelle != None
+            )
+        )
+        .group_by(SessionIA.problematique_libelle)
+    )
+    counts = {r.problematique_libelle: r.nombre for r in result_counts.all()}
+
+    themes = [
+        {"theme": p.libelle, "nombre": counts.get(p.libelle, 0)}
+        for p in problematiques
+    ]
+    themes.sort(key=lambda x: x["nombre"], reverse=True)
+
+    result_total = await db.execute(
+        select(func.count(SessionIA.id))
+        .where(
+            and_(
+                SessionIA.debut_le >= date_debut,
+                SessionIA.statut != "EN_COURS"
+            )
+        )
+    )
+    total = result_total.scalar() or 0
+
+    return {"themes": themes, "total_sessions_analysees": total}
+
 
 
 @app.get("/admin/problematiques")
