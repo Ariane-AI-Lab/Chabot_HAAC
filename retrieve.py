@@ -190,7 +190,7 @@ def configurer_chatbot():
         allow_dangerous_deserialization=True
     )
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-flash-lite",
         temperature=0,
         google_api_key=gemini_key
     )

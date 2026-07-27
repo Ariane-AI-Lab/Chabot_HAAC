@@ -1252,24 +1252,34 @@ async def get_questions_frequentes(
 ):
     """Retourne les dernières questions posées au chatbot IA."""
     result = await db.execute(
-        select(MessageIA)
-        .where(MessageIA.a_handover == False)
-        .order_by(MessageIA.envoye_le.desc())
+        select(MessageSessionIA)
+        .where(MessageSessionIA.expediteur == "ia")
+        .order_by(MessageSessionIA.envoye_le.desc())
         .limit(limite)
     )
-    messages = result.scalars().all()
+    reponses = result.scalars().all()
 
-    return {
-        "questions": [
-            {
-                "phone": m.phone,
-                "question": m.question,
-                "duree_sec": round(m.duree_ms / 1000, 2) if m.duree_ms else None,
-                "date": m.envoye_le.strftime("%d/%m/%Y à %H:%M") if m.envoye_le else ""
-            }
-            for m in messages
-        ]
-    }
+    questions = []
+    for r in reponses:
+        result_q = await db.execute(
+            select(MessageSessionIA)
+            .where(
+                MessageSessionIA.session_id == r.session_id,
+                MessageSessionIA.expediteur == "client",
+                MessageSessionIA.envoye_le <= r.envoye_le,
+            )
+            .order_by(MessageSessionIA.envoye_le.desc())
+            .limit(1)
+        )
+        q = result_q.scalar_one_or_none()
+        questions.append({
+            "phone": r.phone,
+            "question": q.texte if q else "(question introuvable)",
+            "duree_sec": round(r.duree_ms / 1000, 2) if r.duree_ms else None,
+            "date": r.envoye_le.strftime("%d/%m/%Y à %H:%M") if r.envoye_le else ""
+        })
+
+    return {"questions": questions}
 
 @app.get("/admin/themes-frequents")
 async def get_themes_frequents(
