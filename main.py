@@ -6,17 +6,18 @@ import time
 import asyncio
 import mammoth
 import shutil
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import httpx
+#import smtplib
+#from email.mime.multipart import MIMEMultipart
+#from email.mime.text import MIMEText
 from datetime import datetime
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy import select, update, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi import FastAPI, Request, Response, UploadFile, File, HTTPException, Depends, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Response, UploadFile, File, HTTPException, Depends, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -64,8 +65,10 @@ WA_API_VERSION = os.getenv("WA_API_VERSION", "v19.0")
 WABA_ID = os.getenv("WABA_ID")
 PATH_FAISS = "faiss_index_haac"
 HF_TOKEN = os.getenv("HF_TOKEN")
-GMAIL_SENDER = os.getenv("GMAIL_SENDER")
-GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
+#GMAIL_SENDER = os.getenv("GMAIL_SENDER")
+#GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+RESEND_FROM = os.getenv("RESEND_FROM", "HAAC <onboarding@resend.dev>")
 SECRET_KEY = os.getenv("SECRET_KEY")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 ADMIN_NOM = os.getenv("ADMIN_NOM", "Admin")
@@ -154,25 +157,30 @@ def send_whatsapp_message(to: str, text: str):
 
 
 async def envoyer_email_html(destinataires: list[str], sujet: str, html_body: str):
-    if not GMAIL_SENDER or not GMAIL_PASSWORD:
-        print("[EMAIL] ⚠️ Variables Gmail manquantes, envoi ignoré.")
+    if not RESEND_API_KEY:
+        print("[EMAIL] ⚠️ RESEND_API_KEY manquante, envoi ignoré.")
         return False
 
-    def envoyer_emails():
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
-            for email_dest in destinataires:
-                msg = MIMEMultipart("alternative")
-                msg["Subject"] = sujet
-                msg["From"] = GMAIL_SENDER
-                msg["To"] = email_dest
-                msg.attach(MIMEText(html_body, "html"))
-                server.sendmail(GMAIL_SENDER, email_dest, msg.as_string())
-                print(f"[EMAIL] ✅ Email envoyé à {email_dest}")
-
     try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, envoyer_emails)
+        async with httpx.AsyncClient(timeout=10) as client:
+            for email_dest in destinataires:
+                response = await client.post(
+                    "https://api.resend.com/emails",
+                    headers={
+                        "Authorization": f"Bearer {RESEND_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "from": RESEND_FROM,
+                        "to": [email_dest],
+                        "subject": sujet,
+                        "html": html_body,
+                    },
+                )
+                if response.status_code in (200, 201):
+                    print(f"[EMAIL] ✅ Email envoyé à {email_dest}")
+                else:
+                    print(f"[EMAIL] ❌ Échec envoi à {email_dest} : {response.status_code} — {response.text}")
         return True
     except Exception as e:
         print(f"[EMAIL] ❌ Échec envoi email : {e}")
@@ -550,7 +558,7 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
 
             send_whatsapp_message(sender_id,
                 "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊...")
-            await notifier_agents_par_email(sender_id, user_text)
+            asyncio.create_task(notifier_agents_par_email(sender_id, user_text))
 
             if sender_id in followup_tasks:
                 followup_tasks[sender_id].cancel()
@@ -908,6 +916,7 @@ async def get_dashboard_stats(
 @app.post("/admin/creer-agent")
 async def creer_agent(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     admin: Agent = Depends(get_admin_connecte)
 ):
@@ -954,7 +963,7 @@ async def creer_agent(
     </body></html>
     """
 
-    await envoyer_email_html([email], "Votre accès à la plateforme HAAC", html_body)
+    background_tasks.add_task(envoyer_email_html, [email], "Votre accès à la plateforme HAAC", html_body)
 
     print(f"[ADMIN] ✅ Compte {role} créé : {email} par {admin.nom}")
     return {
