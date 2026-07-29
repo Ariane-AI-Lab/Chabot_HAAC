@@ -993,7 +993,30 @@ async def lister_agents(
         for a in agents
     ]
 
+@app.put("/admin/agents/{agent_id}")
+async def modifier_agent(
+    agent_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    admin: Agent = Depends(get_admin_connecte)
+):
+    """Modifie le rôle et/ou le statut (actif) d'un agent.
+    L'admin ne peut modifier que le rôle et le statut des autres comptes,
+    jamais leur nom, email ou mot de passe."""
+    body = await request.json()
+    result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent = result.scalar_one_or_none()
 
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent introuvable.")
+
+    if "role" in body and body["role"] in ("agent", "admin", "superadmin"):
+        agent.role = body["role"]
+    if "actif" in body:
+        agent.actif = body["actif"]
+
+    await db.commit()
+    return {"status": "success", "message": "Agent mis à jour."}
 async def modifier_agent(
     agent_id: int,
     request: Request,
