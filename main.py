@@ -1013,6 +1013,98 @@ async def modifier_agent(
     return {"status": "success", "message": "Agent mis à jour."}
 
 
+@app.get("/admin/me")
+async def get_admin_profile(
+    db: AsyncSession = Depends(get_db),
+    admin: Agent = Depends(get_admin_connecte)
+):
+    """Retourne les informations du profil admin connecté."""
+    return {
+        "id": admin.id,
+        "nom": admin.nom,
+        "email": admin.email,
+        "role": admin.role,
+        "actif": admin.actif,
+        "cree_le": admin.cree_le.strftime("%d/%m/%Y à %H:%M") if admin.cree_le else None,
+        "mot_de_passe": "***"
+    }
+
+
+@app.put("/admin/me")
+async def update_admin_profile(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    admin: Agent = Depends(get_admin_connecte)
+):
+    """Permet à l'admin connecté de modifier son profil, sauf son rôle."""
+    body = await request.json()
+
+    if "nom" in body and body["nom"].strip():
+        admin.nom = body["nom"].strip()
+    if "email" in body and body["email"].strip():
+        existing = await db.execute(select(Agent).where(Agent.email == body["email"].strip(), Agent.id != admin.id))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Cet email est déjà utilisé.")
+        admin.email = body["email"].strip()
+    if "mot_de_passe" in body and body["mot_de_passe"]:
+        admin.mot_de_passe = hasher_mot_de_passe(body["mot_de_passe"])
+
+    await db.commit()
+    return {"status": "success", "message": "Profil admin mis à jour."}
+
+
+@app.post("/admin/logout")
+async def logout_admin():
+    """Déconnexion côté API pour l'admin."""
+    return {"status": "success", "message": "Déconnecté."}
+
+
+@app.get("/agent/me")
+async def get_agent_profile(
+    db: AsyncSession = Depends(get_db),
+    agent: Agent = Depends(get_agent_connecte)
+):
+    """Retourne les informations du profil agent connecté."""
+    return {
+        "id": agent.id,
+        "nom": agent.nom,
+        "email": agent.email,
+        "role": agent.role,
+        "actif": agent.actif,
+        "cree_le": agent.cree_le.strftime("%d/%m/%Y à %H:%M") if agent.cree_le else None,
+        "mot_de_passe": "***"
+    }
+
+
+@app.put("/agent/me")
+async def update_agent_profile(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    agent: Agent = Depends(get_agent_connecte)
+):
+    """Permet à l'agent connecté de modifier son profil, sauf son rôle."""
+    body = await request.json()
+
+    if "nom" in body and body["nom"].strip():
+        agent.nom = body["nom"].strip()
+    if "email" in body and body["email"].strip():
+        existing = await db.execute(select(Agent).where(Agent.email == body["email"].strip(), Agent.id != agent.id))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Cet email est déjà utilisé.")
+        agent.email = body["email"].strip()
+    if "mot_de_passe" in body and body["mot_de_passe"]:
+        agent.mot_de_passe = hasher_mot_de_passe(body["mot_de_passe"])
+
+    await db.commit()
+    return {"status": "success", "message": "Profil agent mis à jour."}
+
+
+@app.post("/agent/logout")
+async def logout_agent():
+    """Déconnexion côté API pour l'agent."""
+    return {"status": "success", "message": "Déconnecté."}
+
+
 @app.put("/me/password")
 async def changer_mot_de_passe_compte(
     request: Request,
