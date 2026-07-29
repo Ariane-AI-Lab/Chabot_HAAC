@@ -153,10 +153,33 @@ def send_whatsapp_message(to: str, text: str):
         print(f"[WHATSAPP] ❌ Erreur réseau : {e}")
 
 
-async def notifier_agents_par_email(sender_id: str, user_text: str):
+async def envoyer_email_html(destinataires: list[str], sujet: str, html_body: str):
     if not GMAIL_SENDER or not GMAIL_PASSWORD:
-        print("[EMAIL] ⚠️ Variables Gmail manquantes, notification ignorée.")
-        return
+        print("[EMAIL] ⚠️ Variables Gmail manquantes, envoi ignoré.")
+        return False
+
+    def envoyer_emails():
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
+            for email_dest in destinataires:
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = sujet
+                msg["From"] = GMAIL_SENDER
+                msg["To"] = email_dest
+                msg.attach(MIMEText(html_body, "html"))
+                server.sendmail(GMAIL_SENDER, email_dest, msg.as_string())
+                print(f"[EMAIL] ✅ Email envoyé à {email_dest}")
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, envoyer_emails)
+        return True
+    except Exception as e:
+        print(f"[EMAIL] ❌ Échec envoi email : {e}")
+        return False
+
+
+async def notifier_agents_par_email(sender_id: str, user_text: str):
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Agent).where(Agent.actif == True))
@@ -196,23 +219,11 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
     </body></html>
     """
 
-    def envoyer_emails():
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
-            for email_dest in emails_destinataires:
-                msg = MIMEMultipart("alternative")
-                msg["Subject"] = f"[HAAC] Assistance requise — +{sender_id}"
-                msg["From"] = GMAIL_SENDER
-                msg["To"] = email_dest
-                msg.attach(MIMEText(html_body, "html"))
-                server.sendmail(GMAIL_SENDER, email_dest, msg.as_string())
-                print(f"[EMAIL] ✅ Notification envoyée à {email_dest}")
-
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, envoyer_emails)
-    except Exception as e:
-        print(f"[EMAIL] ❌ Échec envoi email : {e}")
+    await envoyer_email_html(
+        emails_destinataires,
+        f"[HAAC] Assistance requise — +{sender_id}",
+        html_body
+    )
 
 
 async def classifier_session_ia(contexte_conversation: str) -> tuple[int | None, str | None]:
@@ -900,15 +911,15 @@ async def creer_agent(
     db: AsyncSession = Depends(get_db),
     admin: Agent = Depends(get_admin_connecte)
 ):
-    """Crée un nouveau compte agent ou admin."""
+    """Crée un nouveau compte agent ou admin et envoie un email d’invitation."""
     body = await request.json()
     nom = body.get("nom", "").strip()
     email = body.get("email", "").strip()
     mot_de_passe = body.get("mot_de_passe", "").strip()
     role = body.get("role", "agent").strip()
 
-    if not nom or not email or not mot_de_passe:
-        raise HTTPException(status_code=400, detail="Nom, email et mot de passe sont obligatoires.")
+    if not nom or not email:
+        raise HTTPException(status_code=400, detail="Nom et email sont obligatoires.")
 
     if role not in ("agent", "admin"):
         raise HTTPException(status_code=400, detail="Le rôle doit être 'agent' ou 'admin'.")
@@ -916,6 +927,9 @@ async def creer_agent(
     result = await db.execute(select(Agent).where(Agent.email == email))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Un compte avec cet email existe déjà.")
+
+    if not mot_de_passe:
+        mot_de_passe = f"Haac2026!{email.split('@')[0][:4].upper()}"
 
     nouvel_agent = Agent(
         nom=nom,
@@ -927,8 +941,27 @@ async def creer_agent(
     db.add(nouvel_agent)
     await db.commit()
 
+    html_body = f"""
+    <html><body style="font-family: Arial, sans-serif; color: #333;">
+        <h2 style="color: #0b66c2;">Bienvenue sur la plateforme HAAC</h2>
+        <p>Bonjour {nom},</p>
+        <p>Votre compte a été créé sur la plateforme HAAC.</p>
+        <p><strong>Email :</strong> {email}</p>
+        <p><strong>Mot de passe temporaire :</strong> {mot_de_passe}</p>
+        <p>Veuillez vous connecter puis modifier votre mot de passe dès votre première connexion.</p>
+        <p>Merci,</p>
+        <p>L'équipe HAAC</p>
+    </body></html>
+    """
+
+    await envoyer_email_html([email], "Votre accès à la plateforme HAAC", html_body)
+
     print(f"[ADMIN] ✅ Compte {role} créé : {email} par {admin.nom}")
-    return {"status": "success", "message": f"Compte {role} créé pour {nom}."}
+    return {
+        "status": "success",
+        "message": f"Compte {role} créé pour {nom}.",
+        "mot_de_passe_temporaire": mot_de_passe
+    }
 
 
 @app.get("/admin/agents")
@@ -978,6 +1011,32 @@ async def modifier_agent(
 
     await db.commit()
     return {"status": "success", "message": "Agent mis à jour."}
+
+
+@app.put("/agents/me/password")
+async def changer_mot_de_passe_agent(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    agent: Agent = Depends(get_agent_connecte)
+):
+    """Permet à un agent connecté de changer son mot de passe."""
+    body = await request.json()
+    mot_de_passe_actuel = body.get("mot_de_passe_actuel", "").strip()
+    nouveau_mot_de_passe = body.get("nouveau_mot_de_passe", "").strip()
+
+    if not mot_de_passe_actuel or not nouveau_mot_de_passe:
+        raise HTTPException(status_code=400, detail="Les deux mots de passe sont obligatoires.")
+
+    if not verifier_mot_de_passe(mot_de_passe_actuel, agent.mot_de_passe):
+        raise HTTPException(status_code=401, detail="Mot de passe actuel incorrect.")
+
+    if len(nouveau_mot_de_passe) < 6:
+        raise HTTPException(status_code=400, detail="Le nouveau mot de passe doit contenir au moins 6 caractères.")
+
+    agent.mot_de_passe = hasher_mot_de_passe(nouveau_mot_de_passe)
+    await db.commit()
+
+    return {"status": "success", "message": "Mot de passe mis à jour."}
 
 
 @app.delete("/admin/agents/{agent_id}")
