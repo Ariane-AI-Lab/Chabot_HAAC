@@ -67,8 +67,8 @@ PATH_FAISS = "faiss_index_haac"
 HF_TOKEN = os.getenv("HF_TOKEN")
 #GMAIL_SENDER = os.getenv("GMAIL_SENDER")
 #GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-RESEND_FROM = os.getenv("RESEND_FROM", "HAAC <onboarding@resend.dev>")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
+BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL")
 SECRET_KEY = os.getenv("SECRET_KEY")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 ADMIN_NOM = os.getenv("ADMIN_NOM", "Admin")
@@ -157,35 +157,35 @@ def send_whatsapp_message(to: str, text: str):
 
 
 async def envoyer_email_html(destinataires: list[str], sujet: str, html_body: str):
-    if not RESEND_API_KEY:
-        print("[EMAIL] ⚠️ RESEND_API_KEY manquante, envoi ignoré.")
+    if not BREVO_API_KEY:
+        print("[EMAIL] ⚠️ BREVO_API_KEY manquante, envoi ignoré.")
         return False
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            for email_dest in destinataires:
-                response = await client.post(
-                    "https://api.resend.com/emails",
-                    headers={
-                        "Authorization": f"Bearer {RESEND_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "from": RESEND_FROM,
-                        "to": [email_dest],
-                        "subject": sujet,
-                        "html": html_body,
-                    },
-                )
-                if response.status_code in (200, 201):
-                    print(f"[EMAIL] ✅ Email envoyé à {email_dest}")
-                else:
-                    print(f"[EMAIL] ❌ Échec envoi à {email_dest} : {response.status_code} — {response.text}")
+            response = await client.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers={
+                    "api-key": BREVO_API_KEY,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={
+                    "sender": {"name": "HAAC", "email": BREVO_SENDER_EMAIL},
+                    "to": [{"email": e} for e in destinataires],
+                    "subject": sujet,
+                    "htmlContent": html_body,
+                },
+            )
+            if response.status_code in (200, 201):
+                print(f"[EMAIL] ✅ Email envoyé à {', '.join(destinataires)}")
+            else:
+                print(f"[EMAIL] ❌ Échec envoi : {response.status_code} — {response.text}")
         return True
     except Exception as e:
         print(f"[EMAIL] ❌ Échec envoi email : {e}")
         return False
-
+    
 
 async def notifier_agents_par_email(sender_id: str, user_text: str):
 
