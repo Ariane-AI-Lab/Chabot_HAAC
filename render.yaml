@@ -23,3 +23,17 @@ services:
         sync: false
       - key: TAVILY_API_KEY
         sync: false
+      - key: GMAIL_SENDER
+        sync: false
+      - key: GMAIL_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_NOM
+        value: Admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DASHBOARD_URL
+        sync: false

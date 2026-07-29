@@ -538,9 +538,7 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
                 await db.commit()
 
             send_whatsapp_message(sender_id,
-                "Je ne parviens pas à trouver une réponse officielle et précise "
-                "à votre demande dans mes documents.\n\n"
-                "⏳ *Je vous mets immédiatement en relation avec un agent de la HAAC*...")
+                "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊...")
             await notifier_agents_par_email(sender_id, user_text)
 
             if sender_id in followup_tasks:

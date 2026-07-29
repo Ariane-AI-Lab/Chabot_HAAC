@@ -13,6 +13,42 @@ from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
+HANDOVER_TRIGGER = "[TRIGGER_HANDOVER]"
+
+
+def _is_gemini_quota_error(error: Exception) -> bool:
+    """Détecte les erreurs de quota / rate limit / service saturé de Gemini."""
+    message = str(error).lower()
+    patterns = [
+        "429",
+        "quota",
+        "daily quota",
+        "resource exhausted",
+        "rate limit",
+        "insufficient quota",
+        "too many requests",
+        "temporarily unavailable",
+        "service overloaded",
+        "try again later",
+        "exceeded"
+    ]
+    return any(pattern in message for pattern in patterns)
+
+
+def _safe_llm_invoke(llm, prompt: str, *, context: str = "generation"):
+    """Appelle le LLM et bascule vers le handover si Gemini est en quota."""
+    try:
+        response = llm.invoke(prompt)
+        if hasattr(response, "content"):
+            return response.content.strip()
+        return str(response).strip()
+    except Exception as e:
+        if _is_gemini_quota_error(e):
+            print(f"[GEMINI] ⚠️ Quota ou limite atteinte → handover forcé ({context}) : {e}")
+            return HANDOVER_TRIGGER
+        raise
+
+
 # --- TAVILY : recherche web sur haac.bj (toujours appelé) ---
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
@@ -114,7 +150,9 @@ def condense_query_with_history(llm, history_str: str, current_query: str) -> st
     Requête optimisée :"""
     
     try:
-        response = llm.invoke(condensation_prompt).content.strip()
+        response = _safe_llm_invoke(llm, condensation_prompt, context="condensation")
+        if response == HANDOVER_TRIGGER:
+            return current_query
         print(f"[CONDENSE] 🧠 Requête contextualisée : '{response}'")
         return response
     except Exception as e:
@@ -134,7 +172,9 @@ def expand_query(llm, query: str) -> list[str]:
         Réponds UNIQUEMENT avec les 3 reformulations, une par ligne, sans numérotation ni tiret.
     """
     try:
-        response = llm.invoke(expansion_prompt).content.strip()
+        response = _safe_llm_invoke(llm, expansion_prompt, context="expansion")
+        if response == HANDOVER_TRIGGER:
+            return [query]
         variants = [v.strip() for v in response.split('\n') if v.strip()]
         all_queries = [query] + variants[:3]
         print(f"[EXPAND] 🔄 Requêtes générées : {all_queries}")
@@ -333,10 +373,10 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     }
 
     # 6. Génération
-    bot_response = llm.invoke(prompt.format(**input_data)).content.strip()
+    bot_response = _safe_llm_invoke(llm, prompt.format(**input_data), context="generation")
 
     # 7. Mise à jour mémoire (Uniquement si ce n'est pas un trigger de handover)
-    if "[TRIGGER_HANDOVER]" not in bot_response:
+    if HANDOVER_TRIGGER not in bot_response:
         memory.add_message("user", query, user_id)
         memory.add_message("assistant", bot_response, user_id)
 
