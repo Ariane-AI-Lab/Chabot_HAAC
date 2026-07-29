@@ -985,14 +985,15 @@ async def lister_agents(
     ]
 
 
-@app.put("/admin/agents/{agent_id}")
 async def modifier_agent(
     agent_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
     admin: Agent = Depends(get_admin_connecte)
 ):
-    """Modifie les informations d'un agent existant."""
+    """Modifie le rôle et/ou le statut (actif) d'un agent.
+    L'admin ne peut modifier que le rôle et le statut des autres comptes,
+    jamais leur nom, email ou mot de passe."""
     body = await request.json()
     result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = result.scalar_one_or_none()
@@ -1000,14 +1001,10 @@ async def modifier_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent introuvable.")
 
-    if "nom" in body:
-        agent.nom = body["nom"]
-    if "role" in body and body["role"] in ("agent", "admin"):
+    if "role" in body and body["role"] in ("agent", "admin", "superadmin"):
         agent.role = body["role"]
     if "actif" in body:
         agent.actif = body["actif"]
-    if "mot_de_passe" in body and body["mot_de_passe"]:
-        agent.mot_de_passe = hasher_mot_de_passe(body["mot_de_passe"])
 
     await db.commit()
     return {"status": "success", "message": "Agent mis à jour."}
@@ -1036,7 +1033,8 @@ async def update_admin_profile(
     db: AsyncSession = Depends(get_db),
     admin: Agent = Depends(get_admin_connecte)
 ):
-    """Permet à l'admin connecté de modifier son profil, sauf son rôle."""
+    """Permet à l'admin connecté de modifier son nom et son email.
+    Le mot de passe se change uniquement via PUT /me/password."""
     body = await request.json()
 
     if "nom" in body and body["nom"].strip():
@@ -1046,8 +1044,6 @@ async def update_admin_profile(
         if existing.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Cet email est déjà utilisé.")
         admin.email = body["email"].strip()
-    if "mot_de_passe" in body and body["mot_de_passe"]:
-        admin.mot_de_passe = hasher_mot_de_passe(body["mot_de_passe"])
 
     await db.commit()
     return {"status": "success", "message": "Profil admin mis à jour."}
@@ -1082,7 +1078,8 @@ async def update_agent_profile(
     db: AsyncSession = Depends(get_db),
     agent: Agent = Depends(get_agent_connecte)
 ):
-    """Permet à l'agent connecté de modifier son profil, sauf son rôle."""
+    """Permet à l'agent connecté de modifier son nom et son email.
+    Le mot de passe se change uniquement via PUT /me/password."""
     body = await request.json()
 
     if "nom" in body and body["nom"].strip():
@@ -1092,8 +1089,6 @@ async def update_agent_profile(
         if existing.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Cet email est déjà utilisé.")
         agent.email = body["email"].strip()
-    if "mot_de_passe" in body and body["mot_de_passe"]:
-        agent.mot_de_passe = hasher_mot_de_passe(body["mot_de_passe"])
 
     await db.commit()
     return {"status": "success", "message": "Profil agent mis à jour."}
