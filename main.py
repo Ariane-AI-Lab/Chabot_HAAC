@@ -1136,12 +1136,12 @@ async def changer_mot_de_passe_compte(
 
 
 @app.delete("/admin/agents/{agent_id}")
-async def desactiver_agent(
+async def supprimer_agent(
     agent_id: int,
     db: AsyncSession = Depends(get_db),
     admin: Agent = Depends(get_admin_connecte)
 ):
-    """Désactive un compte agent (soft delete)."""
+    """Supprime définitivement un compte agent."""
     result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = result.scalar_one_or_none()
 
@@ -1156,13 +1156,12 @@ async def desactiver_agent(
         if len(admins_actifs) <= 1:
             raise HTTPException(
                 status_code=400,
-                detail="Impossible de désactiver le dernier admin actif."
+                detail="Impossible de supprimer le dernier admin actif."
             )
 
-    agent.actif = False
+    await db.delete(agent)
     await db.commit()
-    return {"status": "success", "message": f"Compte de {agent.nom} désactivé."}
-
+    return {"status": "success", "message": f"Compte de {agent.nom} supprimé."}
 
 @app.get("/admin/statistiques")
 async def get_statistiques(
