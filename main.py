@@ -958,6 +958,13 @@ async def creer_agent(
         <p><strong>Email :</strong> {email}</p>
         <p><strong>Mot de passe temporaire :</strong> {mot_de_passe}</p>
         <p>Veuillez vous connecter puis modifier votre mot de passe dès votre première connexion.</p>
+        <br>
+        <a href="{DASHBOARD_URL}"
+           style="background:#0b66c2; color:white; padding:12px 24px;
+                  text-decoration:none; border-radius:5px; font-size:16px;">
+            👉 Accéder à la plateforme
+        </a>
+        <br><br>
         <p>Merci,</p>
         <p>L'équipe HAAC</p>
     </body></html>
