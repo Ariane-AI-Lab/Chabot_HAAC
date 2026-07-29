@@ -1013,13 +1013,13 @@ async def modifier_agent(
     return {"status": "success", "message": "Agent mis à jour."}
 
 
-@app.put("/agents/me/password")
-async def changer_mot_de_passe_agent(
+@app.put("/me/password")
+async def changer_mot_de_passe_compte(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    compte: Agent = Depends(get_agent_connecte)
 ):
-    """Permet à un agent connecté de changer son mot de passe."""
+    """Permet à tout compte connecté (agent ou admin) de changer son mot de passe."""
     body = await request.json()
     mot_de_passe_actuel = body.get("mot_de_passe_actuel", "").strip()
     nouveau_mot_de_passe = body.get("nouveau_mot_de_passe", "").strip()
@@ -1027,13 +1027,13 @@ async def changer_mot_de_passe_agent(
     if not mot_de_passe_actuel or not nouveau_mot_de_passe:
         raise HTTPException(status_code=400, detail="Les deux mots de passe sont obligatoires.")
 
-    if not verifier_mot_de_passe(mot_de_passe_actuel, agent.mot_de_passe):
+    if not verifier_mot_de_passe(mot_de_passe_actuel, compte.mot_de_passe):
         raise HTTPException(status_code=401, detail="Mot de passe actuel incorrect.")
 
     if len(nouveau_mot_de_passe) < 6:
         raise HTTPException(status_code=400, detail="Le nouveau mot de passe doit contenir au moins 6 caractères.")
 
-    agent.mot_de_passe = hasher_mot_de_passe(nouveau_mot_de_passe)
+    compte.mot_de_passe = hasher_mot_de_passe(nouveau_mot_de_passe)
     await db.commit()
 
     return {"status": "success", "message": "Mot de passe mis à jour."}
