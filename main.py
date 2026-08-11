@@ -23,6 +23,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from index import HuggingFaceAPIEmbeddings, preparer_documents
 from retrieve import configurer_chatbot, poser_question_avec_memoire
+from retrieve import quota_is_exhausted
 from database import engine, get_db, Base, AsyncSessionLocal
 from models import Agent, Conversation, Message, Problematique, Session, MessageIA, MessageSessionIA, SessionIA
 from sqlalchemy import select, update, func, and_
@@ -237,6 +238,10 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
 async def classifier_session_ia(contexte_conversation: str) -> tuple[int | None, str | None]:
     """Classifie une conversation IA complète dans une problématique."""
     try:
+        if quota_is_exhausted():
+            print("[CLASSIFIER] ⏳ Quota en cooldown, classification ignorée.")
+            return None, None
+
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(Problematique).order_by(Problematique.libelle.asc())
@@ -515,16 +520,19 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
         trivial_response = handle_trivial(user_text, llm=chatbot["llm"], history=history)
         if trivial_response:
             send_whatsapp_message(sender_id, trivial_response)
+            chatbot["memory"].add_message("user", user_text, sender_id)
+            chatbot["memory"].add_message("assistant", trivial_response, sender_id)
             reset_followup_timer(sender_id)
             return
-
+        
         # Pipeline RAG
         t0 = time.time()
         result = poser_question_avec_memoire(chatbot, user_text, user_id=sender_id)
         bot_answer_raw = result.get('response', '')
-
+        necessite_handover = result.get('necessite_handover', False)
+        raison_handover = result.get('raison_handover')
         # Handover
-        if "[TRIGGER_HANDOVER]" in bot_answer_raw:
+        if necessite_handover:
             # Clôturer session IA avant de passer en humain
             if sender_id in SESSIONS_IA_ACTIVES:
                 asyncio.create_task(
@@ -532,7 +540,18 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
                 )
 
             async with AsyncSessionLocal() as db:
-                # Créer la session humaine (celle que le dashboard agent affiche)
+                # 1. Garantir que la ligne "conversations" existe AVANT la session
+                conv_existante = await db.execute(
+                    select(Conversation).where(Conversation.phone == sender_id)
+                )
+                conv_ex = conv_existante.scalar_one_or_none()
+                if not conv_ex:
+                    db.add(Conversation(phone=sender_id, statut="HUMAIN"))
+                else:
+                    conv_ex.statut = "HUMAIN"
+                await db.flush()  # garantit l'insert avant la session
+
+                # 2. Créer la session humaine
                 nouvelle_session = Session(phone=sender_id, statut="HUMAIN")
                 db.add(nouvelle_session)
                 await db.flush()
@@ -543,21 +562,17 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
                     expediteur="client",
                     texte=user_text
                 ))
-
-                # Marquer/mettre à jour le pointeur de statut global par numéro
-                conv_existante = await db.execute(
-                    select(Conversation).where(Conversation.phone == sender_id)
-                )
-                conv_ex = conv_existante.scalar_one_or_none()
-                if not conv_ex:
-                    db.add(Conversation(phone=sender_id, statut="HUMAIN"))
-                else:
-                    conv_ex.statut = "HUMAIN"
-
                 await db.commit()
 
-            send_whatsapp_message(sender_id,
-                "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊...")
+            if raison_handover == "QUOTA":
+               print(f"[HANDOVER] 🚦 Escalade humaine due au quota Gemini pour {sender_id}")
+               send_whatsapp_message(sender_id,
+                   "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊 "
+                   "(forte affluence en ce moment)...")
+            else:
+                send_whatsapp_message(sender_id,
+                    "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊...")
+                
             asyncio.create_task(notifier_agents_par_email(sender_id, user_text))
 
             if sender_id in followup_tasks:
@@ -1617,8 +1632,8 @@ async def upload_docx_to_faiss(file: UploadFile = File(...)):
         ]
         header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=150,
+            chunk_size=1800,
+            chunk_overlap=250,
             separators=["\n\n", "\n", ".", " ", ""]
         )
 

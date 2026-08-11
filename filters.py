@@ -1,6 +1,7 @@
 import re
 import time
 from collections import defaultdict
+from retrieve import quota_is_exhausted
 
 # ---------------------------------------------------------------------------
 # CONSTANTES SPAM
@@ -119,6 +120,10 @@ def check_if_goodbye_llm(llm, text: str) -> bool:
     """Utilise le LLM pour détecter si l'utilisateur souhaite clore la conversation."""
     if llm is None:
         return False
+
+    if quota_is_exhausted():
+        return False
+
     try:
         response = llm.invoke(CLOTURE_CLASSIFY_PROMPT.format(text=text)).content.strip().upper()
         return "OUI" in response
@@ -136,7 +141,7 @@ def handle_trivial(text: str, llm=None, history: str = None) -> str | None:
     # Étape 1b : Pures banalités (merci, ok, émojis) -> Réponse automatique
     if any(p.match(text) for p in TRIVIAL_COMPILED):
         print(f"[FILTER] ⚠️ Trivial (regex) : '{text[:50]}'")
-        if llm is None:
+        if llm is None or quota_is_exhausted():
             return "Très bien ! Je reste disponible si vous avez des questions. 😊"
         try:
             response = llm.invoke(TRIVIAL_RESPONSE_PROMPT.format(text=text)).content.strip()
@@ -152,7 +157,7 @@ def handle_trivial(text: str, llm=None, history: str = None) -> str | None:
         return None
 
     # Étape 2 : Cas ambigus (uniquement pour le premier échange de la session)
-    if llm is None:
+    if llm is None or quota_is_exhausted():
         return None
 
     try:

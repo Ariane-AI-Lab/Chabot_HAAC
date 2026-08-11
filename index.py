@@ -17,9 +17,10 @@ class HuggingFaceAPIEmbeddings(Embeddings):
         if not text.strip():
             return [0.0] * 1024  
         text = text.replace("\n", " ")
+        text_to_embed = f"passage: {text}"
         for attempt in range(3):
             try:
-                result = self.client.feature_extraction(text, model=self.model)
+                result = self.client.feature_extraction(text_to_embed, model=self.model)
                 return result.tolist() if hasattr(result, 'tolist') else list(result)
             except Exception as e:
                 if "429" in str(e):
@@ -54,8 +55,8 @@ def preparer_documents(chemin_dossier):
     
     header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, 
-        chunk_overlap=150,
+        chunk_size=1800,
+        chunk_overlap=250,
         separators=["\n\n", "\n", ".", " ", ""]
     )
     
