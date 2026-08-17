@@ -29,11 +29,11 @@ def creer_token(data: dict) -> str:
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_agent_connecte(
+async def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db)
 ) -> Agent:
-    """Vérifie le token JWT et retourne l'agent connecté."""
+    """Vérifie le token JWT et retourne l'utilisateur connecté (agent ou admin)."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Token invalide ou expiré. Veuillez vous reconnecter.",
@@ -54,11 +54,12 @@ async def get_agent_connecte(
         raise credentials_exception
     return agent
 
-async def get_admin_connecte(agent: Agent = Depends(get_agent_connecte)) -> Agent:
-    """Vérifie que l'agent connecté est bien un admin."""
-    if agent.role != "admin":
+async def get_admin_connecte(current_user: Agent = Depends(get_current_user)) -> Agent:
+    """Restriction supplémentaire : accepte UNIQUEMENT les administrateurs.
+    Dépendance de garde pour les endpoints réservés aux admins."""
+    if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Accès réservé aux administrateurs."
         )
-    return agent
+    return current_user

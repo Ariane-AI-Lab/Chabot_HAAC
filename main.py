@@ -42,7 +42,7 @@ from auth import (
     hasher_mot_de_passe,
     verifier_mot_de_passe,
     creer_token,
-    get_agent_connecte,
+    get_current_user,
     get_admin_connecte
 )
 
@@ -136,25 +136,70 @@ def markdown_to_whatsapp(text: str) -> str:
 
 
 def send_whatsapp_message(to: str, text: str):
+    """Envoie un message WhatsApp. Si le texte dépasse 4000 caractères,
+    le divise en plusieurs messages pour éviter les troncatures."""
     url = f"https://graph.facebook.com/{WA_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
-    }
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        if response.status_code == 200:
-            print(f"[WHATSAPP] ✅ Message envoyé avec succès à {to}")
-        else:
-            print(f"[WHATSAPP] ❌ Échec envoi — Status: {response.status_code} — {response.text}")
-    except requests.exceptions.RequestException as e:
-        print(f"[WHATSAPP] ❌ Erreur réseau : {e}")
+    
+    # Limite de sécurité : 4000 caractères par message WhatsApp
+    MAX_LENGTH = 4000
+    
+    # Si le message est trop long, le splitter par paragraphes
+    if len(text) <= MAX_LENGTH:
+        messages = [text]
+    else:
+        # Splitter par double retour à la ligne pour garder la structure
+        paragraphs = text.split("\n\n")
+        messages = []
+        current_msg = ""
+        
+        for para in paragraphs:
+            if len(current_msg) + len(para) + 2 <= MAX_LENGTH:
+                current_msg += ("\n\n" if current_msg else "") + para
+            else:
+                if current_msg:
+                    messages.append(current_msg)
+                # Si un seul paragraphe est > MAX_LENGTH, le splitter par lignes
+                if len(para) > MAX_LENGTH:
+                    lines = para.split("\n")
+                    line_msg = ""
+                    for line in lines:
+                        if len(line_msg) + len(line) + 1 <= MAX_LENGTH:
+                            line_msg += ("\n" if line_msg else "") + line
+                        else:
+                            if line_msg:
+                                messages.append(line_msg)
+                            line_msg = line
+                    if line_msg:
+                        messages.append(line_msg)
+                else:
+                    current_msg = para
+        
+        if current_msg:
+            messages.append(current_msg)
+    
+    # Envoyer chaque message avec un délai léger entre eux
+    for i, msg in enumerate(messages):
+        if i > 0:
+            time.sleep(0.3)  # Délai entre les messages pour éviter le rate limiting
+        
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": msg}
+        }
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=10)
+            if response.status_code == 200:
+                print(f"[WHATSAPP] ✅ Message {i+1}/{len(messages)} envoyé à {to}")
+            else:
+                print(f"[WHATSAPP] ❌ Échec envoi — Status: {response.status_code} — {response.text}")
+        except requests.exceptions.RequestException as e:
+            print(f"[WHATSAPP] ❌ Erreur réseau : {e}")
 
 
 async def envoyer_email_html(destinataires: list[str], sujet: str, html_body: str):
@@ -295,6 +340,11 @@ async def wait_and_send_followup(sender_id: str):
     try:
         await asyncio.sleep(FOLLOWUP_DELAY)
 
+        # Vérifier que la session IA est toujours active
+        if sender_id not in SESSIONS_IA_ACTIVES:
+            print(f"[FOLLOWUP] ℹ️ Session {sender_id} déjà clôturée, annulation de la relance.")
+            return
+
         # Vérifier si conversation humaine active
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -334,6 +384,11 @@ async def attendre_et_cloturer_timeout(sender_id: str):
     """
     try:
         await asyncio.sleep(TIMEOUT_CLOTURE)
+
+        # Vérifier que la session IA est toujours active
+        if sender_id not in SESSIONS_IA_ACTIVES:
+            print(f"[TIMEOUT] ℹ️ Session {sender_id} déjà clôturée, timeout ignoré.")
+            return
 
         # Vérifier qu'il n'y a pas eu de réponse entre-temps
         current_time = time.time()
@@ -414,10 +469,19 @@ async def cloturer_session_ia(
     except Exception as e:
         print(f"[SESSION IA] ❌ Erreur clôture : {e}")
     finally:
-        # Nettoyer la mémoire
+        # Nettoyer la mémoire et annuler tous les timers associés
         SESSIONS_IA_ACTIVES.pop(sender_id, None)
-        if sender_id in TIMEOUT_TASKS:
+        last_message_time.pop(sender_id, None)  # Réinitialiser le timestamp
+        
+        # Annuler le timer de suivi (relance)
+        if sender_id in followup_tasks and not followup_tasks[sender_id].done():
+            followup_tasks[sender_id].cancel()
+        followup_tasks.pop(sender_id, None)
+        
+        # Annuler le timer de timeout
+        if sender_id in TIMEOUT_TASKS and not TIMEOUT_TASKS[sender_id].done():
             TIMEOUT_TASKS[sender_id].cancel()
+            TIMEOUT_TASKS.pop(sender_id, None)
             TIMEOUT_TASKS.pop(sender_id, None)
 
 
@@ -706,7 +770,7 @@ embeddings = HuggingFaceAPIEmbeddings(api_key=HF_TOKEN)
 @app.get("/conversations-humaines")
 async def get_human_conversations(
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    agent: Agent = Depends(get_current_user)
 ):
     """Retourne toutes les sessions avec leurs messages associés."""
     result = await db.execute(
@@ -748,7 +812,7 @@ async def get_human_conversations(
 async def prendre_conversation(
     session_id: int,
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    agent: Agent = Depends(get_current_user)
 ):
     """Permet à un agent de prendre en charge une session en attente."""
     s = await db.get(Session, session_id)
@@ -769,7 +833,7 @@ async def agent_reply(
     session_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    agent: Agent = Depends(get_current_user)
 ):
     """Envoie un message WhatsApp au client depuis l'agent."""
     s = await db.get(Session, session_id)
@@ -802,7 +866,7 @@ async def agent_reply(
 @app.get("/problematiques")
 async def lister_problematiques_public(
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    agent: Agent = Depends(get_current_user)
 ):
     """Liste les problématiques disponibles pour le formulaire de clôture."""
     result = await db.execute(select(Problematique).order_by(Problematique.libelle.asc()))
@@ -815,7 +879,7 @@ async def close_human_session(
     session_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    agent: Agent = Depends(get_current_user)
 ):
     """Clôture une session humaine et demande une note de satisfaction."""
     s = await db.get(Session, session_id)
@@ -1112,7 +1176,7 @@ async def logout_admin():
 @app.get("/agent/me")
 async def get_agent_profile(
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    agent: Agent = Depends(get_current_user)
 ):
     """Retourne les informations du profil agent connecté."""
     return {
@@ -1130,7 +1194,7 @@ async def get_agent_profile(
 async def update_agent_profile(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    agent: Agent = Depends(get_agent_connecte)
+    agent: Agent = Depends(get_current_user)
 ):
     """Permet à l'agent connecté de modifier son nom et son email.
     Le mot de passe se change uniquement via PUT /me/password."""
@@ -1158,7 +1222,7 @@ async def logout_agent():
 async def changer_mot_de_passe_compte(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    compte: Agent = Depends(get_agent_connecte)
+    compte: Agent = Depends(get_current_user)
 ):
     """Permet à tout compte connecté (agent ou admin) de changer son mot de passe."""
     body = await request.json()
