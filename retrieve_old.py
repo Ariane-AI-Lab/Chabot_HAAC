@@ -1,5 +1,4 @@
 import os
-import re
 import time
 from huggingface_hub import InferenceClient
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -111,33 +110,9 @@ class ConversationMemory:
         return formatted
 
 
-# --- GESTION DU QUOTA GEMINI ---
-# Google renvoie DEUX types de 429 bien distincts, identifiables via le champ
-# quota_id du message d'erreur :
-#   - "...PerMinute..." → quota court terme, se libère en quelques secondes.
-#     → on peut se permettre d'attendre le retry_delay indiqué et retenter.
-#   - "...PerDay..."    → quota journalier épuisé. Le retry_delay que Google
-#     renvoie est souvent court (quelques dizaines de secondes) mais TROMPEUR :
-#     retenter à ce moment-là retombera sur le même 429, car le vrai quota ne
-#     se réinitialise qu'au changement de jour. On ne retente donc jamais dans
-#     ce cas, on passe directement en handover et on attend plus longtemps
-#     avant de retester.
-
+# --- GESTION DU QUOTA GEMINI (cooldown + détection) ---
 QUOTA_ERROR_MARKERS = ("429", "quota", "resourceexhausted", "resource_exhausted")
-
-# Combien de temps on arrête complètement d'appeler Gemini avant de retester,
-# selon le type de quota touché.
-COOLDOWN_QUOTA_MINUTE_DEFAULT = 65   # utilisé si Google ne précise pas de délai
-COOLDOWN_QUOTA_JOUR = 30 * 60        # 30 min : le vrai reset n'arrive qu'à minuit,
-                                      # mais on retente périodiquement au cas où
-                                      # le quota aurait été augmenté entre-temps.
-COOLDOWN_QUOTA_INCONNU = 120
-
-# Pour le quota PAR MINUTE uniquement : on attend et on retente une fois dans
-# le pipeline, mais seulement si le délai indiqué par Google reste court —
-# au-delà, ça bloquerait trop longtemps le traitement (tout le pipeline RAG
-# est actuellement synchrone/bloquant, y compris ce sleep).
-MAX_RETRY_SLEEP_SECONDS = 15
+QUOTA_COOLDOWN_SECONDS = 120  # avant de retenter Gemini après un dépassement
 
 _quota_state = {"exhausted_until": 0.0}
 
@@ -147,85 +122,19 @@ def _is_quota_error(exc: Exception) -> bool:
     return any(marker in msg for marker in QUOTA_ERROR_MARKERS)
 
 
-def _parse_quota_error(exc: Exception):
-    """Extrait le type de quota (PAR MINUTE / JOURNALIER / INCONNU) et le
-    retry_delay en secondes suggéré par Google, à partir du texte de l'erreur."""
-    msg = str(exc)
-    quota_id_match = re.search(r'quota_id:\s*"([^"]+)"', msg)
-    retry_match = re.search(r'retry_delay\s*\{\s*seconds:\s*(\d+)', msg)
-
-    quota_id = quota_id_match.group(1) if quota_id_match else ""
-    retry_seconds = int(retry_match.group(1)) if retry_match else None
-
-    if "PerDay" in quota_id:
-        quota_type = "JOURNALIER"
-    elif "PerMinute" in quota_id:
-        quota_type = "PAR MINUTE"
-    else:
-        quota_type = "INCONNU"
-
-    return quota_type, retry_seconds
-
-
 def quota_is_exhausted() -> bool:
     return time.time() < _quota_state["exhausted_until"]
 
 
-def _mark_quota_exhausted(quota_type: str = "INCONNU", retry_seconds: int | None = None):
-    if quota_type == "JOURNALIER":
-        cooldown = COOLDOWN_QUOTA_JOUR
-    elif quota_type == "PAR MINUTE":
-        cooldown = (retry_seconds + 5) if retry_seconds else COOLDOWN_QUOTA_MINUTE_DEFAULT
-    else:
-        cooldown = COOLDOWN_QUOTA_INCONNU
-
-    _quota_state["exhausted_until"] = time.time() + cooldown
-    print(f"[GEMINI] 🚫 Quota {quota_type} atteint — pipeline en pause {cooldown}s "
-          f"(retry_delay Google : {retry_seconds}s)")
+def _mark_quota_exhausted():
+    _quota_state["exhausted_until"] = time.time() + QUOTA_COOLDOWN_SECONDS
+    print(f"[GEMINI] 🚫 Quota marqué épuisé — nouvelle tentative dans {QUOTA_COOLDOWN_SECONDS}s")
 
 
 def _clear_quota_exhausted():
     if _quota_state["exhausted_until"]:
         _quota_state["exhausted_until"] = 0.0
         print("[GEMINI] ✅ Quota de nouveau disponible")
-
-
-def _call_with_quota_retry(fn, *, context: str):
-    """Exécute fn() (un appel Gemini). En cas de 429 :
-    - quota PAR MINUTE avec un délai <= MAX_RETRY_SLEEP_SECONDS → on attend
-      ce délai et on retente UNE fois avant d'abandonner.
-    - sinon (JOURNALIER, ou délai trop long) → on marque le quota comme
-      épuisé pour la durée adaptée et on relance l'exception telle quelle,
-      pour que l'appelant bascule en handover.
-    """
-    try:
-        return fn()
-    except Exception as e:
-        if not _is_quota_error(e):
-            raise
-
-        quota_type, retry_seconds = _parse_quota_error(e)
-        print(f"[GEMINI] ⚠️ Quota {quota_type} atteint ({context}) — "
-              f"délai suggéré par Google : {retry_seconds}s")
-
-        if quota_type == "PAR MINUTE" and retry_seconds is not None \
-                and retry_seconds <= MAX_RETRY_SLEEP_SECONDS:
-            wait = retry_seconds + 1
-            print(f"[GEMINI] ⏳ Quota court terme — nouvelle tentative dans {wait}s...")
-            time.sleep(wait)
-            try:
-                result = fn()
-                _clear_quota_exhausted()
-                print(f"[GEMINI] ✅ Retentative réussie ({context})")
-                return result
-            except Exception as e2:
-                if _is_quota_error(e2):
-                    quota_type2, retry_seconds2 = _parse_quota_error(e2)
-                    _mark_quota_exhausted(quota_type2, retry_seconds2)
-                raise
-
-        _mark_quota_exhausted(quota_type, retry_seconds)
-        raise
 
 
 # --- SORTIE STRUCTURÉE DU LLM ---
@@ -294,13 +203,14 @@ def condense_query_with_history(llm, history_str: str, current_query: str) -> st
     Requête optimisée :"""
 
     try:
-        response = _call_with_quota_retry(
-            lambda: llm.invoke(condensation_prompt), context="condensation"
-        ).content.strip()
+        response = llm.invoke(condensation_prompt).content.strip()
         print(f"[CONDENSE] 🧠 Requête contextualisée : '{response}'")
         return response
     except Exception as e:
-        if not _is_quota_error(e):
+        if _is_quota_error(e):
+           print(f"[GEMINI] ⚠️ Quota atteint (condensation) : {e}")
+           _mark_quota_exhausted()
+        else:
             print(f"[CONDENSE] ⚠️ Erreur condensation : {e}")
         return current_query
 
@@ -326,16 +236,17 @@ def expand_query(llm, query: str) -> list[str]:
         numérotation ni tiret.
     """
     try:
-        response = _call_with_quota_retry(
-            lambda: llm.invoke(expansion_prompt), context="expansion"
-        ).content.strip()
+        response = llm.invoke(expansion_prompt).content.strip()
         variants = [v.strip() for v in response.split('\n') if v.strip()]
         all_queries = [query] + variants[:3]
         print(f"[EXPAND] 🔄 Requêtes générées : {all_queries}")
         return all_queries
     except Exception as e:
-        if not _is_quota_error(e):
-            print(f"[EXPAND] ⚠️ Erreur expansion, utilisation de la requête originale : {e}")
+        if _is_quota_error(e):
+           print(f"[GEMINI] ⚠️ Quota atteint (expansion) : {e}")
+           _mark_quota_exhausted()
+        else:
+           print(f"[EXPAND] ⚠️ Erreur expansion, utilisation de la requête originale : {e}")
         return [query]
 
 
@@ -416,12 +327,12 @@ def configurer_chatbot():
         RÈGLES DE COMPORTEMENT :
 
         1. SALUTATIONS :
-        - Ne salue QUE si HISTORIQUE == "Aucune conversation précédente" ET que
-            "QUESTION ACTUELLE" contient une salutation (bonjour, bonsoir, salut...).
-        - Si une conversation précédente existe déjà (HISTORIQUE non vide), ne
-            salue plus JAMAIS, même si l'utilisateur redit "bonjour" par politesse
-            en début de message — réponds directement à la question.
-        - Ne salue jamais deux fois dans un même échange.
+        - Regarde UNIQUEMENT "QUESTION ACTUELLE" pour décider de saluer ou non.
+        - Si "QUESTION ACTUELLE" contient une salutation (bonjour, bonsoir, salut...) 
+            → réponds à la salutation chaleureusement avant de répondre à la question.
+        - Si "QUESTION ACTUELLE" ne contient PAS de salutation → ne salue JAMAIS, 
+            réponds directement à la question.
+        - Ne te base JAMAIS sur l'historique pour décider de saluer.
 
         2. GUIDAGE INTERACTIF (CHOIX MULTIPLES) :
         - Si la question de l'utilisateur est générale (ex: "Quelle est la procédure pour la carte de presse ?") et que les sources montrent que la procédure dépend de plusieurs situations distinctes (ex: Première délivrance, Renouvellement, Duplicata) :
@@ -552,8 +463,7 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     print(f"[PIPELINE] ✅ Expansion + Tavily terminés en {time.time()-t0:.2f}s")
     print(f"[TAVILY] 📄 {len(tavily_context)} caractères récupérés")
 
-    # Si le quota a été touché pendant l'expansion (ex. quota journalier
-    # détecté), inutile d'aller plus loin.
+    # Si le quota a été touché pendant l'expansion, inutile d'aller plus loin
     if quota_is_exhausted():
         print(f"[GEMINI] ⏳ Quota détecté en cours de pipeline → handover direct pour user_id={user_id}")
         return {
@@ -586,21 +496,19 @@ def poser_question_avec_memoire(chatbot_config, query, user_id=None):
     # 6. Génération (sortie structurée, plus de marqueur texte)
     raison_handover = None
     try:
-        structured = _call_with_quota_retry(
-            lambda: llm_structure.invoke(prompt.format(**input_data)),
-            context="generation"
-        )
+        structured = llm_structure.invoke(prompt.format(**input_data))
         bot_response = (structured.reponse or "").strip()
         necessite_handover = bool(structured.necessite_handover)
         _clear_quota_exhausted()
     except Exception as e:
-        # En cas d'échec (quota non récupérable, ou autre panne API), on
-        # bascule vers un handover plutôt que de risquer une réponse non
-        # vérifiée.
+        # En cas d'échec du mode structuré (ex. panne API), on bascule vers un
+        # handover plutôt que de risquer une réponse non vérifiée.
         if _is_quota_error(e):
-            raison_handover = "QUOTA"
+           print(f"[GEMINI] ⚠️ Quota ou limite atteinte → handover forcé (generation) : {e}")
+           _mark_quota_exhausted()
+           raison_handover = "QUOTA"
         else:
-            print(f"[LLM] ⚠️ Erreur sortie structurée, handover de sécurité : {e}")
+           print(f"[LLM] ⚠️ Erreur sortie structurée, handover de sécurité : {e}")
         bot_response = ""
         necessite_handover = True
 

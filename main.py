@@ -245,7 +245,7 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
         return
 
     heure = datetime.now().strftime("%d/%m/%Y à %H:%M")
-    dashboard_url = f"{DASHBOARD_URL}/conversation/{sender_id}"
+    dashboard_url = f"{DASHBOARD_URL}/conversations-humaines"
 
     html_body = f"""
     <html><body style="font-family: Arial, sans-serif; color: #333;">
