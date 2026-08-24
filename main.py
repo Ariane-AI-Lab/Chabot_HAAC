@@ -42,6 +42,7 @@ from auth import (
     hasher_mot_de_passe,
     verifier_mot_de_passe,
     creer_token,
+    REMEMBER_ME_EXPIRE_DAYS,
     get_current_user,
     get_admin_connecte
 )
@@ -75,6 +76,10 @@ ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 ADMIN_NOM = os.getenv("ADMIN_NOM", "Admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://ton-dashboard.com")
+PENDING_MESSAGES: dict[str, list[str]] = {}
+DEBOUNCE_TASKS: dict[str, asyncio.Task] = {}
+DEBOUNCE_DELAY = 4  # secondes d'attente après le dernier message avant traitement
+
 
 
 if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID or not VERIFY_TOKEN:
@@ -201,6 +206,18 @@ def send_whatsapp_message(to: str, text: str):
         except requests.exceptions.RequestException as e:
             print(f"[WHATSAPP] ❌ Erreur réseau : {e}")
 
+async def debounce_and_process(sender_id: str):
+    try:
+        await asyncio.sleep(DEBOUNCE_DELAY)
+        messages = PENDING_MESSAGES.pop(sender_id, [])
+        DEBOUNCE_TASKS.pop(sender_id, None)
+        if not messages:
+            return
+        combined_text = "\n".join(messages)
+        await process_whatsapp_pipeline(sender_id, combined_text)
+    except asyncio.CancelledError:
+        pass
+
 
 async def envoyer_email_html(destinataires: list[str], sujet: str, html_body: str):
     if not BREVO_API_KEY:
@@ -246,6 +263,7 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
 
     heure = datetime.now().strftime("%d/%m/%Y à %H:%M")
     dashboard_url = f"{DASHBOARD_URL}"
+    user_text_html = user_text.replace(chr(10), "<br>")  # \n -> <br> pour un affichage correct en HTML
 
     html_body = f"""
     <html><body style="font-family: Arial, sans-serif; color: #333;">
@@ -257,7 +275,7 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
             </tr>
             <tr style="background: #f9f9f9;">
                 <td style="padding: 8px; font-weight: bold;">Message du client</td>
-                <td style="padding: 8px;"><em>"{user_text}"</em></td>
+                <td style="padding: 8px;"><em>{user_text_html}</em></td>
             </tr>
             <tr>
                 <td style="padding: 8px; font-weight: bold;">Heure</td>
@@ -278,7 +296,6 @@ async def notifier_agents_par_email(sender_id: str, user_text: str):
         f"[HAAC] Assistance requise — +{sender_id}",
         html_body
     )
-
 
 async def classifier_session_ia(contexte_conversation: str) -> tuple[int | None, str | None]:
     """Classifie une conversation IA complète dans une problématique."""
@@ -597,14 +614,12 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
         raison_handover = result.get('raison_handover')
         # Handover
         if necessite_handover:
-            # Clôturer session IA avant de passer en humain
             if sender_id in SESSIONS_IA_ACTIVES:
-                asyncio.create_task(
-                    cloturer_session_ia(sender_id, "CLOTUREE_AU_REVOIR")
-                )
+                asyncio.create_task(cloturer_session_ia(sender_id, "CLOTUREE_AU_REVOIR"))
+
+            historique = chatbot["memory"].get_recent_messages(sender_id)
 
             async with AsyncSessionLocal() as db:
-                # 1. Garantir que la ligne "conversations" existe AVANT la session
                 conv_existante = await db.execute(
                     select(Conversation).where(Conversation.phone == sender_id)
                 )
@@ -613,13 +628,24 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
                     db.add(Conversation(phone=sender_id, statut="HUMAIN"))
                 else:
                     conv_ex.statut = "HUMAIN"
-                await db.flush()  # garantit l'insert avant la session
+                await db.flush()
 
-                # 2. Créer la session humaine
                 nouvelle_session = Session(phone=sender_id, statut="HUMAIN")
                 db.add(nouvelle_session)
                 await db.flush()
 
+                # Réinjecter tout l'historique IA (question/réponse) comme messages
+                # distincts, pour que l'agent voie le fil complet plutôt que le
+                # dernier message isolé.
+                for msg in historique:
+                    db.add(Message(
+                        phone=sender_id,
+                        session_id=nouvelle_session.id,
+                        expediteur="client" if msg["role"] == "user" else "ia",
+                        texte=msg["content"]
+                    ))
+
+                # Le message courant qui a déclenché le handover
                 db.add(Message(
                     phone=sender_id,
                     session_id=nouvelle_session.id,
@@ -629,15 +655,17 @@ async def process_whatsapp_pipeline(sender_id: str, user_text: str):
                 await db.commit()
 
             if raison_handover == "QUOTA":
-               print(f"[HANDOVER] 🚦 Escalade humaine due au quota Gemini pour {sender_id}")
-               send_whatsapp_message(sender_id,
-                   "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊 "
-                   "(forte affluence en ce moment)...")
+                send_whatsapp_message(sender_id,
+                    "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊 "
+                    "(forte affluence en ce moment)...")
             else:
                 send_whatsapp_message(sender_id,
                     "Veuillez patienter un instant, je vous mets en relation avec un agent de la HAAC 😊...")
-                
-            asyncio.create_task(notifier_agents_par_email(sender_id, user_text))
+
+            # Email : texte brut lisible, indépendant du fil affiché sur le dashboard
+            lignes_email = [f"{m['role'].upper()}: {m['content']}" for m in historique]
+            lignes_email.append(f"CLIENT: {user_text}")
+            asyncio.create_task(notifier_agents_par_email(sender_id, "\n".join(lignes_email)))
 
             if sender_id in followup_tasks:
                 followup_tasks[sender_id].cancel()
@@ -747,8 +775,13 @@ async def handle_message(request: Request):
         sender_id = message['from']
         user_text = message['text']['body']
 
-        print(f"\n[WEBHOOK] 📩 Nouveau message de : {sender_id} (ID: {message_id})")
-        asyncio.create_task(process_whatsapp_pipeline(sender_id, user_text))
+        PENDING_MESSAGES.setdefault(sender_id, []).append(user_text)
+
+        if sender_id in DEBOUNCE_TASKS and not DEBOUNCE_TASKS[sender_id].done():
+            DEBOUNCE_TASKS[sender_id].cancel()
+        DEBOUNCE_TASKS[sender_id] = asyncio.create_task(debounce_and_process(sender_id))
+
+        print(f"\n[WEBHOOK] 📩 Nouveau message de : {sender_id} (ID: {message_id}) — en attente du debounce")
 
     except Exception as e:
         print(f"[WEBHOOK-ERREUR] ❌ Erreur critique parsing : {e}")
@@ -783,7 +816,7 @@ async def get_human_conversations(
         msgs_result = await db.execute(
             select(Message)
             .where(Message.session_id == s.id)
-            .order_by(Message.envoye_le.asc())
+            .order_by(Message.envoye_le.asc(), Message.id.asc())  # id comme tie-breaker
         )
         messages = msgs_result.scalars().all()
         data.append({
@@ -924,6 +957,7 @@ async def login(request: Request, db: AsyncSession = Depends(get_db)):
     body = await request.json()
     email = body.get("email", "").strip()
     mot_de_passe = body.get("mot_de_passe", "").strip()
+    remember_me = bool(body.get("remember_me", False))
 
     result = await db.execute(select(Agent).where(Agent.email == email))
     agent = result.scalar_one_or_none()
@@ -934,7 +968,11 @@ async def login(request: Request, db: AsyncSession = Depends(get_db)):
     if not agent.actif:
         raise HTTPException(status_code=403, detail="Compte désactivé. Contactez l'administrateur.")
 
-    token = creer_token({"sub": agent.email, "role": agent.role, "nom": agent.nom})
+    duree_token_heures = 24 * REMEMBER_ME_EXPIRE_DAYS if remember_me else 8
+    token = creer_token(
+        {"sub": agent.email, "role": agent.role, "nom": agent.nom},
+        expires_hours=duree_token_heures
+    )
     return {
         "access_token": token,
         "token_type": "bearer",

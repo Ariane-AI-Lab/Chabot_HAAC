@@ -110,6 +110,11 @@ class ConversationMemory:
             formatted += f"\n{msg['role'].upper()}: {msg['content']}"
         return formatted
 
+    def get_recent_messages(self, user_id=None):
+        """Retourne l'historique brut (liste de dicts role/content) pour ce user_id."""
+        user_id = user_id or "default"
+        return list(self._get_user_memory(user_id))
+
 
 # --- GESTION DU QUOTA GEMINI ---
 # Google renvoie DEUX types de 429 bien distincts, identifiables via le champ

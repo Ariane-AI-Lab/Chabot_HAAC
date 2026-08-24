@@ -12,6 +12,7 @@ from models import Agent
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8  # Token valide 8h (une journée de travail)
+REMEMBER_ME_EXPIRE_DAYS = 30
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -23,9 +24,9 @@ def hasher_mot_de_passe(mot_de_passe: str) -> str:
 def verifier_mot_de_passe(mot_de_passe: str, hash: str) -> bool:
     return pwd_context.verify(mot_de_passe[:72], hash)
 
-def creer_token(data: dict) -> str:
+def creer_token(data: dict, expires_hours: int = ACCESS_TOKEN_EXPIRE_HOURS) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    expire = datetime.utcnow() + timedelta(hours=expires_hours)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
