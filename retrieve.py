@@ -133,11 +133,16 @@ COOLDOWN_QUOTA_JOUR = 30 * 60        # 30 min : le vrai reset n'arrive qu'à min
                                       # le quota aurait été augmenté entre-temps.
 COOLDOWN_QUOTA_INCONNU = 120
 
-# Pour le quota PAR MINUTE uniquement : on attend et on retente une fois dans
-# le pipeline, mais seulement si le délai indiqué par Google reste court —
-# au-delà, ça bloquerait trop longtemps le traitement (tout le pipeline RAG
-# est actuellement synchrone/bloquant, y compris ce sleep).
-MAX_RETRY_SLEEP_SECONDS = 15
+# Pour le quota PAR MINUTE : on n'escalade JAMAIS en handover. On attend le
+# retry_delay indiqué par Google (ou une valeur par défaut s'il est absent)
+# et on retente, autant de fois que nécessaire dans la limite de
+# MAX_QUOTA_MINUTE_ATTEMPTS — simple filet de sécurité pour éviter un blocage
+# infini si Google renvoie du PAR MINUTE en boucle (auquel cas on traite ça
+# comme une anomalie et on bascule en handover de sécurité).
+# Rappel : tout le pipeline RAG est actuellement synchrone/bloquant, y
+# compris ces sleep.
+MAX_QUOTA_MINUTE_ATTEMPTS = 3
+DEFAULT_QUOTA_MINUTE_WAIT = 20 
 
 _quota_state = {"exhausted_until": 0.0}
 
@@ -192,40 +197,48 @@ def _clear_quota_exhausted():
 
 def _call_with_quota_retry(fn, *, context: str):
     """Exécute fn() (un appel Gemini). En cas de 429 :
-    - quota PAR MINUTE avec un délai <= MAX_RETRY_SLEEP_SECONDS → on attend
-      ce délai et on retente UNE fois avant d'abandonner.
-    - sinon (JOURNALIER, ou délai trop long) → on marque le quota comme
-      épuisé pour la durée adaptée et on relance l'exception telle quelle,
-      pour que l'appelant bascule en handover.
+    - quota PAR MINUTE → on attend le retry_delay (ou DEFAULT_QUOTA_MINUTE_WAIT
+      s'il est absent) et on retente, jusqu'à MAX_QUOTA_MINUTE_ATTEMPTS fois.
+      On ne marque JAMAIS le quota comme épuisé dans ce cas : pas de handover,
+      l'opération continue normalement une fois la tentative réussie. Si on
+      épuise les tentatives (anomalie), on bascule en handover de sécurité en
+      dernier recours.
+    - quota JOURNALIER (ou type INCONNU) → on marque le quota comme épuisé
+      pour la durée adaptée et on relance l'exception telle quelle, pour que
+      l'appelant bascule en handover.
     """
-    try:
-        return fn()
-    except Exception as e:
-        if not _is_quota_error(e):
-            raise
-
-        quota_type, retry_seconds = _parse_quota_error(e)
-        print(f"[GEMINI] ⚠️ Quota {quota_type} atteint ({context}) — "
-              f"délai suggéré par Google : {retry_seconds}s")
-
-        if quota_type == "PAR MINUTE" and retry_seconds is not None \
-                and retry_seconds <= MAX_RETRY_SLEEP_SECONDS:
-            wait = retry_seconds + 1
-            print(f"[GEMINI] ⏳ Quota court terme — nouvelle tentative dans {wait}s...")
-            time.sleep(wait)
-            try:
-                result = fn()
-                _clear_quota_exhausted()
-                print(f"[GEMINI] ✅ Retentative réussie ({context})")
-                return result
-            except Exception as e2:
-                if _is_quota_error(e2):
-                    quota_type2, retry_seconds2 = _parse_quota_error(e2)
-                    _mark_quota_exhausted(quota_type2, retry_seconds2)
+    attempt = 0
+    while True:
+        try:
+            result = fn()
+            _clear_quota_exhausted()
+            return result
+        except Exception as e:
+            if not _is_quota_error(e):
                 raise
 
-        _mark_quota_exhausted(quota_type, retry_seconds)
-        raise
+            quota_type, retry_seconds = _parse_quota_error(e)
+            attempt += 1
+            print(f"[GEMINI] ⚠️ Quota {quota_type} atteint ({context}, tentative "
+                  f"{attempt}) — délai suggéré par Google : {retry_seconds}s")
+
+            if quota_type == "PAR MINUTE":
+                if attempt >= MAX_QUOTA_MINUTE_ATTEMPTS:
+                    print(f"[GEMINI] 🚫 Quota PAR MINUTE toujours atteint après "
+                          f"{attempt} tentatives ({context}) — anomalie, "
+                          f"handover de sécurité.")
+                    _mark_quota_exhausted(quota_type, retry_seconds)
+                    raise
+
+                wait = (retry_seconds + 1) if retry_seconds is not None else DEFAULT_QUOTA_MINUTE_WAIT
+                print(f"[GEMINI] ⏳ Quota PAR MINUTE — nouvelle tentative dans "
+                      f"{wait}s ({attempt}/{MAX_QUOTA_MINUTE_ATTEMPTS})...")
+                time.sleep(wait)
+                continue  # on retente, PAS de handover
+
+            # JOURNALIER ou INCONNU → on ne retente pas, on bascule en handover
+            _mark_quota_exhausted(quota_type, retry_seconds)
+            raise
 
 
 # --- SORTIE STRUCTURÉE DU LLM ---
